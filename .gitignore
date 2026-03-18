@@ -1,0 +1,8 @@
+.env
+crude_driller.pid
+crude_driller_state.json
+crude_driller.log
+crude_debug.log
+__pycache__/
+*.pyc
+venv/
