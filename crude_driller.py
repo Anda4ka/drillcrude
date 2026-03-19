@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CRUDE Driller v6.1 - Alternate Retry + Space Fixes
+CRUDE Driller v6.4 - Shallow preference + crash fixes
 Architecture: 3 async loops (drilling, claiming, monitoring)
 Key improvement: LLM only identifies company, Python computes artifact deterministically
 """
@@ -73,6 +73,7 @@ BANKR_API_KEY = os.getenv("BANKR_API_KEY", "")
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "https://coordinator-production-38c0.up.railway.app")
 DRILLER_ADDRESS = os.getenv("DRILLER_ADDRESS", "")
 DRILLER_DEBUG = os.getenv("DRILLER_DEBUG", "false").lower() == "true"
+DRILLER_QUIET = os.getenv("DRILLER_QUIET", "false").lower() == "true"
 
 # LLM Config
 LLM_BACKEND = os.getenv("LLM_BACKEND", "openrouter")  # "openrouter" or "zai"
@@ -81,14 +82,22 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 
 # Timing
-DRILL_DELAY = 0  # no delay — coordinator doesn't rate limit, network latency is enough
+DRILL_DELAY_MIN = float(os.environ.get("DRILL_DELAY_MIN", "3.0"))
+DRILL_DELAY_MAX = float(os.environ.get("DRILL_DELAY_MAX", "60.0"))
+DRILL_DELAY_INIT = float(os.environ.get("DRILL_DELAY", "1.0"))  # minimal — receipt posting provides natural ~4s pacing
 CLAIM_INTERVAL = 1800  # 30 min
 MONITOR_INTERVAL = 300  # 5 min
 
-# ============ LOGGING ============
+# ============ LOGGING (buffered I/O) ============
 LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
 LOG_KEEP_BYTES = 5 * 1024 * 1024   # keep last 5 MB after rotation
 _log_check_counter = 0
+_LOG_FLUSH_INTERVAL = 2        # flush main log every N seconds
+_DEBUG_FLUSH_INTERVAL = 5      # flush debug log every N seconds
+_log_buffer = []
+_log_flush_ts = 0.0
+_debug_buffer = []
+_debug_flush_ts = 0.0
 
 def _rotate_if_needed(filepath):
     """Rotate log file: when >10 MB, keep only last 5 MB."""
@@ -113,27 +122,63 @@ def _rotate_if_needed(filepath):
     except Exception:
         pass
 
+def _flush_log():
+    """Flush buffered log lines to disk in one write."""
+    global _log_buffer, _log_flush_ts
+    if not _log_buffer:
+        return
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("".join(_log_buffer))
+        _log_buffer = []
+        _log_flush_ts = time.time()
+        _rotate_if_needed(LOG_FILE)
+    except (PermissionError, OSError):
+        pass
+
+def _flush_debug():
+    """Flush buffered debug lines to disk in one write."""
+    global _debug_buffer, _debug_flush_ts
+    if not _debug_buffer:
+        return
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("".join(_debug_buffer))
+        _debug_buffer = []
+        _debug_flush_ts = time.time()
+        _rotate_if_needed(DEBUG_LOG_FILE)
+    except (PermissionError, OSError):
+        _debug_buffer = []  # drop on error rather than growing forever
+
 def log(msg, level="INFO"):
+    global _log_buffer, _log_flush_ts
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{level}] {msg}"
-    print(line, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    _rotate_if_needed(LOG_FILE)
+    line = f"[{ts}] [{level}] {msg}\n"
+    # Quiet mode: console only for important messages
+    if not DRILLER_QUIET or level in ("ERROR", "WARN") or "ACCEPTED" in msg or "GUSHER" in msg or "credits" in msg.lower():
+        print(line, end="", flush=True)
+    _log_buffer.append(line)
+    # Flush on error immediately, otherwise every N seconds
+    now = time.time()
+    if level == "ERROR" or now - _log_flush_ts >= _LOG_FLUSH_INTERVAL:
+        _flush_log()
 
 def debug_log(label, data):
-    """Write detailed debug data to separate file"""
+    """Buffer debug data, flush periodically to reduce disk I/O."""
+    global _debug_buffer, _debug_flush_ts
     if not DRILLER_DEBUG:
         return
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n")
-        if isinstance(data, (dict, list)):
-            f.write(json.dumps(data, indent=2, ensure_ascii=False))
-        else:
-            f.write(str(data))
-        f.write("\n")
-    _rotate_if_needed(DEBUG_LOG_FILE)
+    entry = f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n"
+    if isinstance(data, (dict, list)):
+        entry += json.dumps(data, indent=2, ensure_ascii=False)
+    else:
+        entry += str(data)
+    entry += "\n"
+    _debug_buffer.append(entry)
+    now = time.time()
+    if now - _debug_flush_ts >= _DEBUG_FLUSH_INTERVAL:
+        _flush_debug()
 
 # ============ EXCEPTIONS ============
 class AuthError(Exception): pass
@@ -157,6 +202,8 @@ class State:
         self.total_credits = 0
         self.gushers = 0
         self.consecutive_failures = 0
+        self._no_cid_attempts = 0
+        self.site_stats = {}  # {"shallow/standard": {"accept": 0, "reject": 0}, ...}
         self.start_time = time.time()
         self.load()
 
@@ -169,19 +216,36 @@ class State:
                 self.total_failures = data.get("total_failures", 0)
                 self.total_credits = data.get("total_credits", 0)
                 self.gushers = data.get("gushers", 0)
+                self.site_stats = data.get("site_stats", {})
                 log(f"State loaded: {self.total_solves} solves, {self.total_credits} credits")
             except Exception as e:
                 log(f"State load error: {e}", "WARN")
 
-    def save(self):
+    def record_site(self, depth, richness, accepted):
+        key = f"{depth}/{richness}"
+        if key not in self.site_stats:
+            self.site_stats[key] = {"accept": 0, "reject": 0}
+        self.site_stats[key]["accept" if accepted else "reject"] += 1
+
+    _SAVE_INTERVAL = 30  # save to disk max once per 30 seconds
+
+    def save(self, force=False):
+        now = time.time()
+        if not force and hasattr(self, '_last_save') and now - self._last_save < self._SAVE_INTERVAL:
+            return  # throttle disk writes
+        self._last_save = now
         data = {
             "drilled_epochs": list(self.drilled_epochs),
             "total_solves": self.total_solves,
             "total_failures": self.total_failures,
             "total_credits": self.total_credits,
-            "gushers": self.gushers
+            "gushers": self.gushers,
+            "site_stats": self.site_stats
         }
-        STATE_FILE.write_text(json.dumps(data, indent=2))
+        try:
+            STATE_FILE.write_text(json.dumps(data, separators=(',', ':')))
+        except (PermissionError, OSError):
+            pass
 
 state = State()
 
@@ -193,7 +257,8 @@ class BankrClient:
         self.session = None
 
     async def init(self):
-        self.session = aiohttp.ClientSession()
+        conn = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=30)
+        self.session = aiohttp.ClientSession(connector=conn)
 
     async def close(self):
         if self.session:
@@ -273,7 +338,8 @@ class CoordinatorClient:
         self._auth_lock = asyncio.Lock()
 
     async def init(self):
-        self.session = aiohttp.ClientSession()
+        conn = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=30)
+        self.session = aiohttp.ClientSession(connector=conn)
 
     async def close(self):
         if self.session:
@@ -288,6 +354,11 @@ class CoordinatorClient:
             return (exp - datetime.now(timezone.utc)).total_seconds() < 60
         except Exception:
             return False
+
+    def reset_auth(self):
+        """Clear cached token so next ensure_auth() forces re-authentication."""
+        self.token = None
+        self.token_expires = None
 
     async def ensure_auth(self):
         async with self._auth_lock:
@@ -327,7 +398,7 @@ class CoordinatorClient:
             "Authorization": f"Bearer {self.token}"
         }
 
-    def _check_status(self, status, data):
+    def _check_status(self, status, data, headers=None):
         """Check HTTP status and raise appropriate exception"""
         if status == 401:
             self.token = None  # force re-auth
@@ -337,7 +408,13 @@ class CoordinatorClient:
         elif status == 404:
             raise StaleError(data.get("error", "Not found / stale challenge"))
         elif status == 429:
-            raise RateLimitError(data.get("error", "Rate limited"))
+            retry_after = None
+            if headers:
+                retry_after = headers.get("Retry-After") or headers.get("retry-after")
+            debug_log("429_RESPONSE", {"body": data, "retry_after": retry_after, "headers": {k: v for k, v in (headers or {}).items() if k.lower() in ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-limit")}})
+            err = RateLimitError(data.get("error", "Rate limited"))
+            err.retry_after = float(retry_after) if retry_after else None
+            raise err
         elif status >= 500:
             raise ServerError(data.get("error", f"Server error {status}"))
 
@@ -360,7 +437,7 @@ class CoordinatorClient:
             headers=self._headers()
         ) as resp:
             data = await resp.json()
-            self._check_status(resp.status, data)
+            self._check_status(resp.status, data, resp.headers)
             return data
 
     async def submit(self, challenge_id, artifact, nonce, site_id, trace):
@@ -370,7 +447,6 @@ class CoordinatorClient:
                 "miner": self.driller,
                 "challengeId": challenge_id,
                 "artifact": artifact,
-                "nonce": nonce,
                 "siteId": site_id,
                 "requestNonce": nonce,
                 "trace": trace
@@ -378,7 +454,7 @@ class CoordinatorClient:
             headers=self._headers()
         ) as resp:
             data = await resp.json()
-            self._check_status(resp.status, data)
+            self._check_status(resp.status, data, resp.headers)
             return data
 
     async def get_claim_calldata(self, epochs):
@@ -398,6 +474,13 @@ class CompanyData:
     founded: Optional[int] = None
     revenue_millions: Optional[int] = None
     margin: Optional[int] = None
+    city: Optional[str] = None
+    sector: Optional[str] = None
+    # Raw values as they appear in the document (for trace validation)
+    employees_raw: Optional[str] = None
+    founded_raw: Optional[str] = None
+    revenue_raw: Optional[str] = None
+    margin_raw: Optional[str] = None
 
 # Regex patterns for data extraction (case-insensitive)
 _EMPLOYEES_RE = [
@@ -434,8 +517,23 @@ _MARGIN_RE = [
     re.compile(r'(\d+(?:\.\d+)?)\s*%\s*margin', re.I),
 ]
 
+_CITY_RES = [
+    re.compile(r'headquartered\s+in\s+([\w\s]+?)(?:\.|,|\s+Founded|\s+The|\s+It|\s+Since|\s+With)', re.I),
+    re.compile(r'(?:based|located|operating)\s+(?:out\s+of\s+|in\s+)([\w\s]+?)(?:\.|,|\s+Founded|\s+The|\s+It|\s+Since|\s+With)', re.I),
+    re.compile(r'operations?\s+in\s+([\w\s]+?)(?:\.|,|\s+the\s+company)', re.I),
+]
+_SECTOR_RES = [
+    re.compile(r'is\s+a[n]?\s+([\w\s-]+?)\s+(?:company|firm|operator|provider|enterprise)', re.I),
+    re.compile(r'(?:leading|major|prominent|established)\s+([\w\s-]+?)\s+(?:company|firm|operator|provider)', re.I),
+    re.compile(r'in\s+the\s+([\w\s-]+?)\s+(?:sector|industry|space|market|segment)', re.I),
+]
+# Keep backward compat for parse_companies
+_CITY_RE = _CITY_RES[0]
+_SECTOR_RE = _SECTOR_RES[0]
+
 # Question type classification
 _QUESTION_MAP = [
+    (re.compile(r'highest.*revenue[- ]+per[- ]+employee', re.I), ('revenue_per_employee', 'max')),
     (re.compile(r'highest.*revenue', re.I),             ('revenue_millions', 'max')),
     (re.compile(r'largest.*revenue', re.I),              ('revenue_millions', 'max')),
     (re.compile(r'greatest.*revenue', re.I),             ('revenue_millions', 'max')),
@@ -474,6 +572,15 @@ def _extract_int(text, patterns):
     return None
 
 
+def _extract_int_raw(text, patterns):
+    """Try each regex pattern, return (parsed_int, raw_match_text) or (None, None)"""
+    for pat in patterns:
+        m = pat.search(text)
+        if m:
+            return int(m.group(1).replace(',', '')), m.group(1)
+    return None, None
+
+
 def _extract_revenue_millions(text):
     """Extract revenue in millions from paragraph text"""
     for pat in _REVENUE_RE:
@@ -483,9 +590,18 @@ def _extract_revenue_millions(text):
             # Check if it's billions or millions
             full_match = m.group(0).lower()
             if 'b' in full_match.replace('$', '').replace(str(m.group(1)), '', 1)[:5]:
-                return int(val * 1000)
+                return round(val * 1000)
             else:
-                return int(val)
+                return round(val)
+    return None
+
+
+def _extract_revenue_raw(text):
+    """Extract raw revenue string as it appears in document (e.g. '$8.7B')"""
+    for pat in _REVENUE_RE:
+        m = pat.search(text)
+        if m:
+            return m.group(0).strip().rstrip('.,;')
     return None
 
 
@@ -494,7 +610,16 @@ def _extract_margin(text):
     for pat in _MARGIN_RE:
         m = pat.search(text)
         if m:
-            return int(float(m.group(1)))
+            return round(float(m.group(1)))
+    return None
+
+
+def _extract_margin_raw(text):
+    """Extract raw margin string as it appears in document"""
+    for pat in _MARGIN_RE:
+        m = pat.search(text)
+        if m:
+            return m.group(1) + "%"
     return None
 
 
@@ -529,13 +654,31 @@ def parse_companies(doc: str, companies: list) -> List[CompanyData]:
         if company in company_to_para:
             pi = company_to_para[company]
             para_text = paragraphs[pi]
+            city_m = None
+            for _cre in _CITY_RES:
+                city_m = _cre.search(para_text)
+                if city_m:
+                    break
+            sector_m = None
+            for _sre in _SECTOR_RES:
+                sector_m = _sre.search(para_text)
+                if sector_m:
+                    break
+            emp_val, emp_raw = _extract_int_raw(para_text, _EMPLOYEES_RE)
+            yr_val, yr_raw = _extract_int_raw(para_text, _FOUNDED_RE)
             cd = CompanyData(
                 name=company,
                 paragraph_idx=pi + 1,  # 1-indexed for trace
-                employees=_extract_int(para_text, _EMPLOYEES_RE),
-                founded=_extract_int(para_text, _FOUNDED_RE),
+                employees=emp_val,
+                founded=yr_val,
                 revenue_millions=_extract_revenue_millions(para_text),
                 margin=_extract_margin(para_text),
+                city=city_m.group(1).strip() if city_m else None,
+                sector=sector_m.group(1).strip().lower() if sector_m else None,
+                employees_raw=emp_raw,
+                founded_raw=yr_raw,
+                revenue_raw=_extract_revenue_raw(para_text),
+                margin_raw=_extract_margin_raw(para_text),
             )
             result.append(cd)
         else:
@@ -565,7 +708,23 @@ def _build_company_data(c):
         "revenue": f"{c.revenue_millions}M" if c.revenue_millions is not None else "N/A",
         "margin": str(c.margin) if c.margin is not None else "N/A",
         "_paragraph_idx": c.paragraph_idx,
+        # Raw values for trace (as they appear in document)
+        "employees_raw": c.employees_raw or (str(c.employees) if c.employees is not None else "N/A"),
+        "founded_raw": c.founded_raw or (str(c.founded) if c.founded is not None else "N/A"),
+        "revenue_raw": c.revenue_raw or (f"${c.revenue_millions}M" if c.revenue_millions is not None else "N/A"),
+        "margin_raw": c.margin_raw or (f"{c.margin}%" if c.margin is not None else "N/A"),
     }
+
+
+# Pre-compiled question filter regexes (avoid re-compiling every cycle)
+_Q_FILTER_CITY_RE = re.compile(r'headquartered\s+in\s+([\w\s]+?)(?:,|\s+which|\s+that|\s+has|\s+had|\s+reported|\s+with|\?)', re.I)
+_Q_FILTER_SECTOR_RES = [
+    re.compile(r'in\s+the\s+([\w\s-]+?)\s+(?:sector|industry|segment)', re.I),
+    re.compile(r'(?:among|of)\s+(?:all\s+)?(?:the\s+)?([\w\s-]+?)\s+(?:companies|firms)', re.I),
+    re.compile(r'which\s+([\w\s-]+?)\s+company', re.I),
+]
+_Q_FILTER_YEAR_BEFORE_RE = re.compile(r'founded\s+(?:before|prior\s+to)\s+(\d{4})', re.I)
+_Q_FILTER_YEAR_AFTER_RE = re.compile(r'founded\s+(?:after|since)\s+(\d{4})', re.I)
 
 
 def deterministic_pass1(doc, questions, companies):
@@ -577,7 +736,7 @@ def deterministic_pass1(doc, questions, companies):
     try:
         debug_log("DET_DOC", doc[:2000])  # Log raw document for debugging
         parsed = parse_companies(doc, companies)
-        debug_log("DET_PARSED", {c.name: {"emp": c.employees, "yr": c.founded, "rev": c.revenue_millions, "margin": c.margin, "para_idx": c.paragraph_idx} for c in parsed})
+        debug_log("DET_PARSED", {c.name: {"emp": c.employees, "yr": c.founded, "rev": c.revenue_millions, "margin": c.margin, "city": c.city, "sector": c.sector, "para_idx": c.paragraph_idx} for c in parsed})
 
         # Use first question (challenges always have 1)
         q = questions[0] if questions else ""
@@ -587,24 +746,94 @@ def deterministic_pass1(doc, questions, companies):
             return None, None, []
 
         field, direction = qtype
-        debug_log("DET_QUESTION", {"q": q, "field": field, "direction": direction})
 
-        # Filter companies that have the required field
-        valid = [c for c in parsed if getattr(c, field) is not None]
+        # Extract question filters (city, sector, year)
+        q_filter_city = None
+        q_filter_sector = None
+        q_filter_year_before = None
+        q_filter_year_after = None
+
+        city_match = _Q_FILTER_CITY_RE.search(q)
+        if city_match:
+            q_filter_city = city_match.group(1).strip()
+
+        # Sector: "in the X sector" or "Which X company"
+        sector_match = None
+        for _sfre in _Q_FILTER_SECTOR_RES:
+            sector_match = _sfre.search(q)
+            if sector_match:
+                break
+        if sector_match:
+            raw_sector = sector_match.group(1).strip().lower()
+            for prefix in ["companies in the ", "companies ", "all "]:
+                if raw_sector.startswith(prefix):
+                    raw_sector = raw_sector[len(prefix):]
+            q_filter_sector = raw_sector
+
+        # Year filter: "founded before 1990", "founded after 2000"
+        year_match = _Q_FILTER_YEAR_BEFORE_RE.search(q)
+        if year_match:
+            q_filter_year_before = int(year_match.group(1))
+        year_match2 = _Q_FILTER_YEAR_AFTER_RE.search(q)
+        if year_match2:
+            q_filter_year_after = int(year_match2.group(1))
+
+        debug_log("DET_QUESTION", {"q": q, "field": field, "direction": direction,
+                                    "filter_city": q_filter_city, "filter_sector": q_filter_sector,
+                                    "filter_year_before": q_filter_year_before, "filter_year_after": q_filter_year_after})
+
+        # Handle computed fields (ratios)
+        if field == 'revenue_per_employee':
+            valid = [c for c in parsed if c.revenue_millions is not None and c.employees is not None and c.employees > 0]
+        else:
+            valid = [c for c in parsed if getattr(c, field) is not None]
+
+        # Apply question filters (city, sector)
+        if q_filter_city and valid:
+            filtered = [c for c in valid if c.city and q_filter_city.lower() in c.city.lower()]
+            if filtered:
+                debug_log("DET_FILTER_CITY", {"city": q_filter_city, "before": len(valid), "after": len(filtered),
+                                               "matched": [c.name for c in filtered]})
+                valid = filtered
+            else:
+                debug_log("DET_FILTER_CITY_MISS", {"city": q_filter_city, "companies_cities": {c.name: c.city for c in valid}})
+        if q_filter_sector and valid:
+            filtered = [c for c in valid if c.sector and (q_filter_sector in c.sector or c.sector in q_filter_sector)]
+            if filtered:
+                debug_log("DET_FILTER_SECTOR", {"sector": q_filter_sector, "before": len(valid), "after": len(filtered),
+                                                 "matched": [c.name for c in filtered]})
+                valid = filtered
+            else:
+                debug_log("DET_FILTER_SECTOR_MISS", {"sector": q_filter_sector, "companies_sectors": {c.name: c.sector for c in valid}})
+        if q_filter_year_before and valid:
+            filtered = [c for c in valid if c.founded is not None and c.founded < q_filter_year_before]
+            if filtered:
+                debug_log("DET_FILTER_YEAR", {"before": q_filter_year_before, "count": len(filtered)})
+                valid = filtered
+        if q_filter_year_after and valid:
+            filtered = [c for c in valid if c.founded is not None and c.founded > q_filter_year_after]
+            if filtered:
+                debug_log("DET_FILTER_YEAR", {"after": q_filter_year_after, "count": len(filtered)})
+                valid = filtered
         if not valid:
             debug_log("DET_NO_VALID", {"field": field, "total": len(parsed)})
             return None, None, []
 
         # Select winner (use paragraph_idx as tiebreaker — first in doc wins)
-        if direction == 'max':
-            winner = max(valid, key=lambda c: (getattr(c, field), -(c.paragraph_idx or 999)))
-        else:
-            winner = min(valid, key=lambda c: (getattr(c, field), c.paragraph_idx or 999))
+        def _get_val(c):
+            if field == 'revenue_per_employee':
+                return c.revenue_millions * 1_000_000 / c.employees  # revenue in $ / employees
+            return getattr(c, field)
 
-        winner_val = getattr(winner, field)
+        if direction == 'max':
+            winner = max(valid, key=lambda c: (_get_val(c), -(c.paragraph_idx or 999)))
+        else:
+            winner = min(valid, key=lambda c: (_get_val(c), c.paragraph_idx or 999))
+
+        winner_val = _get_val(winner)
 
         # Find tied candidates (same field value, different company)
-        tied = [c for c in valid if getattr(c, field) == winner_val and c.name != winner.name]
+        tied = [c for c in valid if _get_val(c) == winner_val and c.name != winner.name]
         # Sort tied candidates by paragraph_idx (opposite order from winner's tiebreaker)
         if direction == 'max':
             tied.sort(key=lambda c: c.paragraph_idx or 999)  # winner used -(para_idx), so alternates are later ones
@@ -630,6 +859,22 @@ def deterministic_pass1(doc, questions, companies):
 # ============ LOCAL COMPUTE ENGINE ============
 def _parse_revenue_to_millions(rev_str):
     """Parse revenue string to millions: '$8.5B' -> 8500, '4.4B' -> 4400, '750M' -> 750"""
+    if not rev_str or rev_str == "N/A":
+        return None
+    rev_str = rev_str.replace("$", "").replace(",", "").strip()
+    m = re.match(r'([\d.]+)\s*[Bb]', rev_str)
+    if m:
+        return round(float(m.group(1)) * 1000)
+    m = re.match(r'([\d.]+)\s*[Mm]', rev_str)
+    if m:
+        return round(float(m.group(1)))
+    m = re.match(r'(\d+)', rev_str)
+    if m:
+        return int(m.group(1))
+    return None
+
+def _parse_revenue_to_millions_trunc(rev_str):
+    """Same as above but with int() truncation instead of round()"""
     if not rev_str or rev_str == "N/A":
         return None
     rev_str = rev_str.replace("$", "").replace(",", "").strip()
@@ -685,9 +930,18 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
             m = re.search(r'mod\s+(\d+)', c)
             if m:
                 n = int(m.group(1))
-                rev = _parse_revenue_to_millions(extracted_data.get("revenue") or extracted_data.get("Q1_REVENUE", ""))
+                rev_str = extracted_data.get("revenue") or extracted_data.get("Q1_REVENUE", "")
+                rev = _parse_revenue_to_millions(rev_str)
                 if rev is not None:
-                    return str(rev % n), "revenue_mod", []
+                    primary = str(rev % n)
+                    # Alt: try int() truncation in case coordinator uses that
+                    alts = []
+                    rev_trunc = _parse_revenue_to_millions_trunc(rev_str)
+                    if rev_trunc is not None and rev_trunc != rev:
+                        alt = str(rev_trunc % n)
+                        if alt != primary:
+                            alts.append(alt)
+                    return primary, "revenue_mod", alts
 
         # "margin ... mod N" or "margin × N" or "margin * N"
         if "margin" in c:
@@ -763,7 +1017,7 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                             alts.append(alt)
                     return primary, "letter_positions", alts
             else:
-                # No explicit strip instruction — try WITH spaces first (coordinator default)
+                # No explicit strip — "canonical name" means WITH spaces (coordinator default)
                 result_ws = []
                 valid_ws = True
                 for p in positions:
@@ -773,7 +1027,7 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                         valid_ws = False
                         break
 
-                # Also compute no-spaces variant
+                # Also compute no-spaces variant as alt
                 result_ns = []
                 valid_ns = True
                 for p in positions:
@@ -799,9 +1053,19 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
             n = int(m.group(1))
             name_ns = company_name.replace(' ', '')
             primary = ''.join(name_ns[i - 1] for i in range(n, len(name_ns) + 1, n))
-            # Alt: with spaces
-            alt = ''.join(company_name[i - 1] for i in range(n, len(company_name) + 1, n))
-            alts = [alt] if alt != primary else []
+            alts = []
+            # Alt 1: with spaces, 1-indexed
+            alt_ws = ''.join(company_name[i - 1] for i in range(n, len(company_name) + 1, n))
+            if alt_ws != primary:
+                alts.append(alt_ws)
+            # Alt 2: no spaces, 0-indexed (positions n-1, 2n-1, 3n-1, ...)
+            alt_0 = ''.join(name_ns[i] for i in range(n - 1, len(name_ns), n))
+            if alt_0 != primary and alt_0 not in alts:
+                alts.append(alt_0)
+            # Alt 3: with spaces, 0-indexed
+            alt_ws0 = ''.join(company_name[i] for i in range(n - 1, len(company_name), n))
+            if alt_ws0 != primary and alt_ws0 not in alts:
+                alts.append(alt_ws0)
             return primary, "every_nth", alts
 
         # "employees × N" or "employees * N"
@@ -917,13 +1181,20 @@ class LLMSolver:
 
                 # Build alternates list: first space-variant alts, then tied-company alts
                 alternates = []
+                # Track (artifact, company) pairs to avoid true duplicates
+                seen_pairs = {(artifact, det_company)}
                 for alt_art in alt_artifacts:
-                    alternates.append((alt_art, det_company, det_data))
+                    if (alt_art, det_company) not in seen_pairs:
+                        seen_pairs.add((alt_art, det_company))
+                        alternates.append((alt_art, det_company, det_data))
                 for alt_name, alt_data in tied_alternates:
                     alt_art, alt_method, alt_art_alts = compute_artifact_locally(alt_name, alt_data, transform_constraint)
-                    if alt_art is not None:
+                    if alt_art is not None and (alt_art, alt_name) not in seen_pairs:
+                        seen_pairs.add((alt_art, alt_name))
                         alternates.append((alt_art, alt_name, alt_data))
-                        for aa in alt_art_alts:
+                    for aa in alt_art_alts:
+                        if (aa, alt_name) not in seen_pairs:
+                            seen_pairs.add((aa, alt_name))
                             alternates.append((aa, alt_name, alt_data))
 
                 return artifact, det_company, det_data, alternates
@@ -1124,72 +1395,52 @@ def pick_best_site(sites, tier="wildcat"):
 
     # Support both possible field names for richness
     richness_order = {"bonanza": 0, "rich": 1, "standard": 2}
+    # Prefer shallower wells at equal richness — data shows shallow has 15%+ higher hit rate
+    # EV: shallow/bonanza 74.1%×10=7.41 > medium/bonanza 57.1%×12=6.85
+    depth_order = {"shallow": 0, "medium": 1, "deep": 2}
     def get_richness(s):
         r = s.get("richness") or s.get("reserveEstimate", "standard")
         return richness_order.get(str(r).lower(), 2)
+    def get_depth(s):
+        return depth_order.get(s.get("estimatedDepth", "shallow"), 2)
 
-    valid.sort(key=lambda s: (get_richness(s), s.get("depletionPct", 0)))
+    valid.sort(key=lambda s: (get_richness(s), get_depth(s), s.get("depletionPct", 0)))
     return valid[0]
 
 # ============ BACKGROUND RECEIPT POSTER ============
 _pending_receipts = asyncio.Queue()
-_receipt_cooldown = 10  # seconds between receipt submissions to avoid in-flight limit
+_receipt_cooldown = int(os.getenv("RECEIPT_COOLDOWN", "30"))  # seconds between receipt tx (saves gas)
 
-async def receipt_poster(bankr):
-    """Background loop: posts receipts on-chain, throttled to avoid in-flight tx limit"""
-    log("Receipt poster started (background, throttled)")
-    last_posted = 0
-    while True:
+async def post_receipt_inline(bankr, tx, desc="CRUDE drilling receipt"):
+    """Post receipt on-chain and wait for confirmation — unlocks next drill"""
+    for attempt in range(3):
         try:
-            tx, desc = await _pending_receipts.get()
-
-            # Drain queue — keep only the LATEST receipt if multiple queued up
-            latest_tx, latest_desc = tx, desc
-            drained = 0
-            while not _pending_receipts.empty():
-                try:
-                    latest_tx, latest_desc = _pending_receipts.get_nowait()
-                    drained += 1
-                except asyncio.QueueEmpty:
-                    break
-            if drained:
-                debug_log("RECEIPT_DRAIN", f"Skipped {drained} stale receipts, posting latest")
-
-            # Throttle: wait until cooldown since last post
-            now = time.time()
-            wait = _receipt_cooldown - (now - last_posted)
-            if wait > 0:
-                await asyncio.sleep(wait)
-
-            for attempt in range(2):
-                try:
-                    tx_result = await bankr.submit_tx(latest_tx, latest_desc)
-                    if tx_result.get("success"):
-                        log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
-                    else:
-                        err = tx_result.get("error", "?")
-                        if "in-flight" in str(err).lower():
-                            debug_log("RECEIPT_INFLIGHT", "In-flight limit, will retry next cycle")
-                            await asyncio.sleep(15)
-                            continue
-                        debug_log("RECEIPT_FAIL", err)
-                    break
-                except Exception as e:
-                    if attempt < 1:
-                        await asyncio.sleep(5)
-                    else:
-                        debug_log("RECEIPT_DROP", str(e))
-            last_posted = time.time()
-        except asyncio.CancelledError:
-            break
+            tx_result = await bankr.submit_tx(tx, desc)
+            if tx_result.get("success"):
+                log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
+                return True
+            else:
+                err = tx_result.get("error", "?")
+                if "in-flight" in str(err).lower():
+                    debug_log("RECEIPT_INFLIGHT", f"In-flight limit, retrying in 5s (attempt {attempt+1})")
+                    await asyncio.sleep(5)
+                    continue
+                debug_log("RECEIPT_FAIL", err)
+                return False
         except Exception as e:
-            log(f"Receipt poster error: {e}", "ERROR")
+            if attempt < 2:
+                await asyncio.sleep(3)
+            else:
+                debug_log("RECEIPT_DROP", str(e))
+                return False
+    return False
 
 # ============ MAIN LOOPS ============
 async def drilling_loop(bankr, coord, solver):
-    """Pipeline drilling loop: receipt posting runs in background"""
-    log("Drilling loop started (pipeline mode)")
+    """Drilling loop: drill → solve → submit → receipt (inline) → repeat"""
+    log("Drilling loop started (inline receipts, ~4s/cycle)")
     retry_attempt = 0
+    drill_delay = DRILL_DELAY_INIT  # adaptive delay
     sites_logged = False
     _cached_sites = None
     _sites_ts = 0
@@ -1199,20 +1450,25 @@ async def drilling_loop(bankr, coord, solver):
             # Ensure auth (with expiry check)
             await coord.ensure_auth()
 
-            # Cache sites for 10 seconds to avoid redundant API calls
+            # Cache sites for 60 seconds to reduce API calls
             now = time.time()
-            if _cached_sites is None or now - _sites_ts > 10:
+            if _cached_sites is None or now - _sites_ts > 60:
                 sites_data = await coord.get_sites()
                 _cached_sites = sites_data.get("sites", [])
                 epoch_id = sites_data.get("epochId")
                 _sites_ts = now
 
-                if not sites_logged and _cached_sites:
-                    debug_log("SITE_STRUCTURE", _cached_sites[0])
-                    sites_logged = True
+                if _cached_sites:
+                    summary = [{"region": s.get("region", "?"), "depth": s.get("estimatedDepth", "?"),
+                                "richness": s.get("richness") or s.get("reserveEstimate", "?"),
+                                "depletion": s.get("depletionPct", "?")} for s in _cached_sites]
+                    debug_log("SITES_AVAILABLE", summary)
+                    if not sites_logged:
+                        debug_log("SITE_STRUCTURE", _cached_sites[0])
+                        sites_logged = True
 
             # Pick best site
-            site = pick_best_site(_cached_sites)
+            site = pick_best_site(_cached_sites, tier="platform")
             if not site:
                 log("No valid sites, waiting 30s...")
                 _cached_sites = None  # force refresh next time
@@ -1220,8 +1476,12 @@ async def drilling_loop(bankr, coord, solver):
                 continue
 
             site_id = site["siteId"]
+            depth = site.get("estimatedDepth", "?")
             richness = site.get("richness") or site.get("reserveEstimate", "?")
-            log(f"Site: {site.get('region', '?')} ({richness}, {site.get('depletionPct', '?')}%)")
+            log(f"Site: {site.get('region', '?')} ({depth}/{richness}, {site.get('depletionPct', '?')}%)")
+
+            # Small delay before drill (cooldown handled by 429 handler)
+            await asyncio.sleep(1)
 
             # Get challenge
             nonce = secrets.token_hex(16)
@@ -1246,9 +1506,51 @@ async def drilling_loop(bankr, coord, solver):
                 log(f"403 Forbidden: {e} — check stake level", "ERROR")
                 await asyncio.sleep(300)
                 continue
-            except RateLimitError:
-                log("429 rate limited on drill", "WARN")
-                await backoff_sleep(retry_attempt)
+            except RateLimitError as e:
+                # Parse exact wait time from coordinator: "Drill cooldown active — wait 26s"
+                msg = str(e)
+                m = re.search(r'wait\s+(\d+)s', msg)
+                if m:
+                    wait = int(m.group(1)) + 1
+                    # Use cooldown time to fetch receipt for pending lot
+                    pending_lot = getattr(state, '_pending_lot', None)
+                    if pending_lot:
+                        log(f"Cooldown {wait-1}s — polling receipt for {pending_lot[:20]}...")
+                        state._pending_lot = None
+                        receipt_posted = False
+                        for poll in range(wait // 3):
+                            await asyncio.sleep(3)
+                            try:
+                                async with coord.session.get(
+                                    f"{coord.url}/v1/receipt-calldata?crudeLotId={pending_lot}&miner={coord.driller}",
+                                    headers=coord._headers()
+                                ) as rresp:
+                                    rdata = await rresp.json()
+                                    if rresp.status == 200:
+                                        rtx = rdata.get("transaction", {})
+                                        if rtx:
+                                            await post_receipt_inline(bankr, rtx)
+                                            receipt_posted = True
+                                        break
+                                    elif rresp.status != 409:
+                                        debug_log("RECEIPT_ERR", f"{rresp.status}: {rdata}")
+                                        break
+                            except Exception as ex:
+                                debug_log("RECEIPT_POLL_ERR", str(ex))
+                                break
+                        if not receipt_posted:
+                            # Wait remaining cooldown
+                            remaining = max(0, wait - (poll + 1) * 3)
+                            if remaining > 0:
+                                await asyncio.sleep(remaining)
+                    else:
+                        log(f"Drill cooldown {wait-1}s, waiting {wait}s")
+                        await asyncio.sleep(wait)
+                else:
+                    retry_after = getattr(e, 'retry_after', None)
+                    wait = retry_after or min(2.0 * (2 ** retry_attempt), 60.0)
+                    log(f"429 on drill: '{e}' waiting {wait:.0f}s", "WARN")
+                    await asyncio.sleep(wait)
                 retry_attempt += 1
                 continue
             except ServerError as e:
@@ -1286,10 +1588,11 @@ async def drilling_loop(bankr, coord, solver):
                                 challenge.get("constraints", []),
                                 challenge.get("companies", [])
                             )
-                            if stale_artifact and validate_artifact(stale_artifact):
+                            if stale_artifact and stale_company and validate_artifact(stale_artifact):
                                 stale_para = stale_extracted.get("_paragraph_idx", 1)
                                 stale_trace = [
-                                    {"type": "extract_value", "paragraph": stale_para, "entity": stale_company, "field": "company_name", "value": stale_company},
+                                    {"type": "locate_entity", "entity": stale_company, "paragraph": stale_para},
+                                    {"type": "extract_value", "paragraph": stale_para, "entity": stale_company, "field": "employees", "value": str(stale_extracted.get("employees_raw", stale_extracted.get("employees", "0")))},
                                     {"type": "apply_constraint", "description": "solve stale drill", "operation": "compute", "result": stale_artifact}
                                 ]
                                 stale_result = await coord.submit(cid, stale_artifact, nonce, site_id, stale_trace)
@@ -1300,14 +1603,14 @@ async def drilling_loop(bankr, coord, solver):
                                     log(f"Stale drill solved! +{credits} credits (total: {state.total_credits})")
                                     tx = stale_result.get("transaction", {})
                                     if tx:
-                                        await _pending_receipts.put((tx, "CRUDE drilling receipt"))
+                                        await post_receipt_inline(bankr, tx)
                                     state.save()
                                 else:
                                     debug_log("STALE_REJECTED", stale_result.get("reason", "?"))
                                 continue  # drill closed, move on
                             else:
                                 # Can't solve — submit dummy to close it
-                                dummy_trace = [{"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
+                                dummy_trace = [{"type": "locate_entity", "entity": "unknown", "paragraph": 1}, {"type": "extract_value", "entity": "unknown", "field": "employees", "value": "0", "paragraph": 1}, {"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
                                 await coord.submit(cid, "0", nonce, site_id, dummy_trace)
                                 continue
                         except Exception as e:
@@ -1315,28 +1618,28 @@ async def drilling_loop(bankr, coord, solver):
                     elif cid:
                         # Has challengeId but no doc — just submit dummy to close
                         try:
-                            dummy_trace = [{"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
+                            dummy_trace = [{"type": "locate_entity", "entity": "unknown", "paragraph": 1}, {"type": "extract_value", "entity": "unknown", "field": "employees", "value": "0", "paragraph": 1}, {"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
                             await coord.submit(cid, "0", nonce, site_id, dummy_trace)
                         except Exception:
                             pass
                         await asyncio.sleep(2)
                     else:
                         # No challengeId — coordinator won't give us the drill data
-                        # Escalate wait: the stale drill will expire on coordinator side
+                        # Wait for drill to expire on coordinator side (usually 2-5 min)
                         no_cid_attempts = getattr(state, '_no_cid_attempts', 0) + 1
                         state._no_cid_attempts = no_cid_attempts
                         if no_cid_attempts == 1:
                             log("Stale drill (no challengeId), waiting for expiry...", "WARN")
-                        wait_secs = min(30 * no_cid_attempts, 120)  # 30, 60, 90, 120 max
+                        wait_secs = min(15 * no_cid_attempts, 60)  # 15, 30, 45, 60 max
                         debug_log("STALE_NO_CID", f"attempt {no_cid_attempts}, waiting {wait_secs}s")
                         try:
-                            coord._token = None
+                            coord.reset_auth()
                             await coord.ensure_auth()
                         except Exception:
                             pass
                         await asyncio.sleep(wait_secs)
-                        if no_cid_attempts >= 5:
-                            log("Stale drill won't clear after 5 attempts, continuing anyway...", "WARN")
+                        if no_cid_attempts >= 8:
+                            log("Stale drill won't clear after 8 attempts, continuing anyway...", "WARN")
                             state._no_cid_attempts = 0
                 else:
                     await asyncio.sleep(5)
@@ -1364,7 +1667,7 @@ async def drilling_loop(bankr, coord, solver):
                 try:
                     cid = challenge.get("challengeId", "")
                     if cid:
-                        dummy_trace = [{"type": "apply_constraint", "description": reason, "operation": "none", "result": "0"}]
+                        dummy_trace = [{"type": "locate_entity", "entity": "unknown", "paragraph": 1}, {"type": "extract_value", "entity": "unknown", "field": "employees", "value": "0", "paragraph": 1}, {"type": "apply_constraint", "description": reason, "operation": "none", "result": "0"}]
                         await coord.submit(cid, "0", nonce, site_id, dummy_trace)
                 except Exception:
                     pass
@@ -1412,16 +1715,17 @@ async def drilling_loop(bankr, coord, solver):
                         company_para = i
                         break
 
-            employees = extracted.get("employees") or extracted.get("Q1_EMPLOYEES", "N/A")
-            founded = extracted.get("founded") or extracted.get("Q1_FOUNDED", "N/A")
-            revenue = extracted.get("revenue") or extracted.get("Q1_REVENUE", "N/A")
-            margin = extracted.get("margin") or extracted.get("Q1_MARGIN", "N/A")
+            # Use raw values (as in document) for trace validation
+            employees_raw = extracted.get("employees_raw") or extracted.get("employees") or extracted.get("Q1_EMPLOYEES", "N/A")
+            founded_raw = extracted.get("founded_raw") or extracted.get("founded") or extracted.get("Q1_FOUNDED", "N/A")
+            revenue_raw = extracted.get("revenue_raw") or extracted.get("revenue") or extracted.get("Q1_REVENUE", "N/A")
+            margin_raw = extracted.get("margin_raw") or extracted.get("margin") or extracted.get("Q1_MARGIN", "N/A")
             trace = [
-                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "company_name", "value": company},
-                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "employees", "value": str(employees)},
-                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "founded", "value": str(founded)},
-                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "revenue", "value": str(revenue)},
-                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "operating_margin", "value": str(margin)},
+                {"type": "locate_entity", "entity": company, "paragraph": company_para},
+                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "employees", "value": str(employees_raw)},
+                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "founded", "value": str(founded_raw)},
+                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "revenue", "value": str(revenue_raw)},
+                {"type": "extract_value", "paragraph": company_para, "entity": company, "field": "margin", "value": str(margin_raw)},
                 {"type": "apply_constraint", "description": f"Applied constraint transformation to {company}", "operation": "compute", "result": artifact}
             ]
 
@@ -1441,9 +1745,10 @@ async def drilling_loop(bankr, coord, solver):
             except StaleError:
                 log("404 stale challenge, fetching new one", "WARN")
                 continue
-            except RateLimitError:
-                log("429 rate limited on submit", "WARN")
-                await backoff_sleep(retry_attempt)
+            except RateLimitError as e:
+                wait = getattr(e, 'retry_after', None) or min(2.0 * (2 ** retry_attempt), 30.0)
+                log(f"429 rate limited on submit, waiting {wait:.1f}s", "WARN")
+                await asyncio.sleep(wait)
                 retry_attempt += 1
                 continue
             except ServerError as e:
@@ -1457,31 +1762,39 @@ async def drilling_loop(bankr, coord, solver):
                 state.total_solves += 1
                 state.total_credits += credits
                 state.consecutive_failures = 0
+                state.record_site(depth, richness, True)
                 log(f"✅ ACCEPTED! +{credits} credits (total: {state.total_credits})")
 
                 if result.get("gusher"):
                     state.gushers += 1
                     log(f"🎉 GUSHER: {result['gusher']}!")
 
-                # Post receipt in BACKGROUND — don't block next drill
+                # Post receipt INLINE — required before next drill per spec
                 tx = result.get("transaction", {})
                 if tx:
-                    await _pending_receipts.put((tx, "CRUDE drilling receipt"))
+                    await post_receipt_inline(bankr, tx)
                 else:
-                    log("No transaction in accepted result!", "ERROR")
+                    lot_id = result.get("crudeLotId")
+                    log(f"No tx, crudeLotId={lot_id}, full={result}")
+                    # Store lot for receipt fetching during cooldown wait
+                    if lot_id:
+                        state._pending_lot = lot_id
 
                 state.save()
             else:
                 reason = result.get("reason", str(result))
-                debug_log("REJECTION", {"reason": reason, "artifact": artifact, "company": company})
+                log(f"❌ REJECTED: {reason} (artifact: '{artifact}', company: {company})")
+                debug_log("REJECTION", {"reason": reason, "artifact": artifact, "company": company, "full_result": result})
 
                 # === RETRY WITH ALTERNATES ===
                 retry_accepted = False
                 if alternates:
                     debug_log("RETRY_ALTS", f"Primary rejected, trying {len(alternates)} alternate(s)")
                     for alt_artifact, alt_company, alt_extracted in alternates:
-                        if not alt_artifact or not validate_artifact(alt_artifact):
+                        if not alt_artifact or not alt_company or not validate_artifact(alt_artifact):
+                            debug_log("ALT_SKIP", {"artifact": alt_artifact, "company": alt_company, "valid": validate_artifact(alt_artifact) if alt_artifact else False})
                             continue
+                        debug_log("ALT_TRYING", {"artifact": alt_artifact, "company": alt_company})
                         # Build trace for alternate
                         alt_para = alt_extracted.get("_paragraph_idx", 0)
                         if not alt_para:
@@ -1493,11 +1806,11 @@ async def drilling_loop(bankr, coord, solver):
                                     alt_para = i
                                     break
                         alt_trace = [
-                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "company_name", "value": alt_company},
-                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "employees", "value": str(alt_extracted.get("employees", "N/A"))},
-                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "founded", "value": str(alt_extracted.get("founded", "N/A"))},
-                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "revenue", "value": str(alt_extracted.get("revenue", "N/A"))},
-                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "operating_margin", "value": str(alt_extracted.get("margin", "N/A"))},
+                            {"type": "locate_entity", "entity": alt_company, "paragraph": alt_para},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "employees", "value": str(alt_extracted.get("employees_raw", alt_extracted.get("employees", "N/A")))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "founded", "value": str(alt_extracted.get("founded_raw", alt_extracted.get("founded", "N/A")))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "revenue", "value": str(alt_extracted.get("revenue_raw", alt_extracted.get("revenue", "N/A")))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "margin", "value": str(alt_extracted.get("margin_raw", alt_extracted.get("margin", "N/A")))},
                             {"type": "apply_constraint", "description": f"Applied constraint transformation to {alt_company}", "operation": "compute", "result": alt_artifact}
                         ]
                         try:
@@ -1508,7 +1821,8 @@ async def drilling_loop(bankr, coord, solver):
                                 site_id,
                                 alt_trace
                             )
-                        except (StaleError, RateLimitError, ServerError):
+                        except (StaleError, RateLimitError, ServerError) as e:
+                            debug_log("ALT_EXCEPTION", {"error": str(e), "type": type(e).__name__})
                             break
                         except AuthError:
                             await coord.ensure_auth()
@@ -1522,13 +1836,14 @@ async def drilling_loop(bankr, coord, solver):
                             state.total_solves += 1
                             state.total_credits += credits
                             state.consecutive_failures = 0
+                            state.record_site(depth, richness, True)
                             log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits (total: {state.total_credits})")
                             if alt_result.get("gusher"):
                                 state.gushers += 1
                                 log(f"🎉 GUSHER: {alt_result['gusher']}!")
                             tx = alt_result.get("transaction", {})
                             if tx:
-                                await _pending_receipts.put((tx, "CRUDE drilling receipt"))
+                                await post_receipt_inline(bankr, tx)
                             state.save()
                             retry_accepted = True
                             break
@@ -1539,16 +1854,15 @@ async def drilling_loop(bankr, coord, solver):
                 if not retry_accepted:
                     state.total_failures += 1
                     state.consecutive_failures += 1
+                    state.record_site(depth, richness, False)
                     debug_log("REJECTED", {"reason": reason, "alts_tried": len(alternates) if alternates else 0})
                     state.save()
 
                     # Circuit breaker
                     if state.consecutive_failures >= 10:
-                        log(f"10 consecutive failures! Pausing 5 min...", "ERROR")
-                        await asyncio.sleep(300)
+                        log(f"10 consecutive failures! Pausing 30s...", "WARN")
+                        await asyncio.sleep(30)
                         state.consecutive_failures = 0
-
-            await asyncio.sleep(DRILL_DELAY)
 
         except (AuthError, ForbiddenError, StaleError, RateLimitError, ServerError):
             raise
@@ -1606,6 +1920,16 @@ async def monitor_loop(bankr, coord):
 
             log(f"Stats: {state.total_solves}/{total} ({rate:.1f}%) | {state.total_credits} credits | {state.gushers} gushers | {hours}h{mins}m")
 
+            # Per-site-type stats
+            if state.site_stats:
+                parts = []
+                for stype, counts in sorted(state.site_stats.items()):
+                    a, r = counts["accept"], counts["reject"]
+                    t = a + r
+                    pct = (a / t * 100) if t > 0 else 0
+                    parts.append(f"{stype}:{a}/{t}({pct:.0f}%)")
+                debug_log("SITE_STATS", " | ".join(parts))
+
             balances = await bankr.get_balances()
             if isinstance(balances, str) and balances != "timeout":
                 log(f"Balances: {balances[:150]}")
@@ -1616,7 +1940,7 @@ async def monitor_loop(bankr, coord):
 # ============ MAIN ============
 async def main():
     log("=" * 60)
-    log("CRUDE Driller v6.1 - Alternate Retry + Space Fixes")
+    log("CRUDE Driller v6.4 - Shallow preference + crash fixes")
     log("=" * 60)
     if DRILLER_DEBUG:
         log("DEBUG MODE ENABLED - verbose logging to crude_debug.log")
@@ -1670,7 +1994,6 @@ async def main():
     try:
         await asyncio.gather(
             _guarded(drilling_loop(bankr, coord, solver)),
-            _guarded(receipt_poster(bankr)),
             _guarded(claim_loop(bankr, coord)),
             _guarded(monitor_loop(bankr, coord))
         )
@@ -1678,10 +2001,13 @@ async def main():
         pass
     finally:
         log("Shutting down...")
-        state.save()
+        state.save(force=True)
+        _flush_log()
+        _flush_debug()
         await bankr.close()
         await coord.close()
         log(f"Final: {state.total_solves}/{state.total_solves + state.total_failures} | {state.total_credits} credits")
+        _flush_log()
         PID_FILE.unlink(missing_ok=True)
 
 def _run():
