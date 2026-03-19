@@ -6,3 +6,4 @@ crude_debug.log
 __pycache__/
 *.pyc
 venv/
+CLAUDE.md
