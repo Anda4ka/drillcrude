@@ -29,11 +29,6 @@ source venv/bin/activate
 pip install aiohttp openai zai-sdk
 ```
 
-**VPS (Ubuntu 22.04) — автоматически:**
-```bash
-bash setup_vps.sh
-```
-
 ### 3. Создай файл `.env`
 
 Создай файл `.env` в папке проекта. Пример:
@@ -91,7 +86,9 @@ TELEGRAM_CHAT_ID=123456789
 | Platform | 50M+ | 2 | Shallow + Medium |
 | Deepwater | 100M+ | 3 | Все |
 
-Купить и застейкать можно через [drillcrude.com](https://www.drillcrude.com) или вручную через Bankr API.
+Купить можно через [drillcrude.com](https://www.drillcrude.com) или вручную через Bankr API.
+
+> **Авто-стейкинг:** Если при первом запуске стейк не обнаружен (ошибка 403), бот предложит застейкать автоматически. Просто нажмите `y` и подтвердите.
 
 ### 5. Запуск
 
@@ -126,7 +123,6 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 |---|---|
 | `crude_driller.py` | Основной скрипт |
 | `claim_now.py` | Ручной клейм наград |
-| `setup_vps.sh` | Автоустановка на VPS |
 | `.env` | Конфигурация (**не коммитить!**) |
 | `crude_driller.log` | Лог работы |
 | `crude_driller_state.json` | Сохранённый прогресс |
@@ -137,7 +133,7 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 |---|---|
 | `Drill cooldown active` | Всё ок — бот ждёт 30 сек автоматически |
 | `wildcat rig cannot access medium wells` | Неправильный `DRILLER_TIER` в `.env`. Если 25M стейк — ставь `wildcat` |
-| `Miner is not eligible` | Проверь стейк. Если есть pending unstake — отмени его |
+| `Miner is not eligible` | Нет стейка — бот предложит застейкать автоматически. Или застейкай на drillcrude.com |
 | `Auth 502` | Координатор временно лежит. Бот retry-ит сам |
 | `Trace must reference the constraint company` | Не та компания — alt-retry попробует другие |
 

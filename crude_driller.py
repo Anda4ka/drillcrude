@@ -100,6 +100,14 @@ TIER_CREDITS = {"wildcat": 1, "platform": 2, "deepwater": 3}
 if DRILLER_TIER not in TIER_CREDITS:
     DRILLER_TIER = "platform"  # safe fallback
 
+# Staking amounts (wei = tokens * 10^18)
+TIER_STAKE_WEI = {
+    "wildcat":  "25000000000000000000000000",
+    "platform": "50000000000000000000000000",
+    "deepwater":"100000000000000000000000000",
+}
+TIER_STAKE_DISPLAY = {"wildcat": "25M", "platform": "50M", "deepwater": "100M"}
+
 # ============ LOGGING (buffered I/O) ============
 LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
 LOG_KEEP_BYTES = 5 * 1024 * 1024   # keep last 5 MB after rotation
@@ -518,6 +526,83 @@ class CoordinatorClient:
         epoch_str = ",".join(map(str, epochs))
         async with self.session.get(f"{self.url}/v1/claim-calldata?epochs={epoch_str}") as resp:
             return await resp.json()
+
+    async def get_stake_approve_calldata(self, amount_wei):
+        async with self.session.get(
+            f"{self.url}/v1/stake-approve-calldata?amount={amount_wei}"
+        ) as resp:
+            return await resp.json()
+
+    async def get_stake_calldata(self, amount_wei):
+        async with self.session.get(
+            f"{self.url}/v1/stake-calldata?amount={amount_wei}"
+        ) as resp:
+            return await resp.json()
+
+
+async def _offer_auto_stake(bankr, coord):
+    """Called on first 403 in drilling_loop — offer interactive staking."""
+    tier = DRILLER_TIER
+    amount_display = TIER_STAKE_DISPLAY[tier]
+    amount_wei = TIER_STAKE_WEI[tier]
+
+    log(f"{'='*50}")
+    log(f"⚠️  Stake required: {amount_display} $CRUDE ({tier} tier)")
+    log(f"    Auto-stake now? (y/n)")
+    log(f"{'='*50}")
+
+    try:
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: input(">>> Stake? (y/n): ").strip().lower()
+        )
+    except (EOFError, KeyboardInterrupt):
+        log("Headless mode — auto-stake unavailable. Stake manually via drillcrude.com", "WARN")
+        return False
+
+    if answer not in ("y", "yes"):
+        log("Staking cancelled by user.")
+        return False
+
+    # Step 1: Approve
+    log(f"Approving {amount_display} $CRUDE for staking...")
+    try:
+        approve_data = await coord.get_stake_approve_calldata(amount_wei)
+        tx = approve_data.get("transaction")
+        if not tx:
+            log(f"Approve calldata error: {approve_data}", "ERROR")
+            return False
+        result = await bankr.submit_tx(tx, f"Approve {amount_display} CRUDE for staking")
+        if not result.get("success"):
+            log(f"Approve tx failed: {result}", "ERROR")
+            return False
+        log(f"✅ Approve OK: {result.get('transactionHash', '?')[:16]}...")
+    except Exception as e:
+        log(f"Approve failed: {e}", "ERROR")
+        return False
+
+    # Step 2: Stake
+    log(f"Staking {amount_display} $CRUDE...")
+    try:
+        stake_data = await coord.get_stake_calldata(amount_wei)
+        tx = stake_data.get("transaction")
+        if not tx:
+            log(f"Stake calldata error: {stake_data}", "ERROR")
+            return False
+        result = await bankr.submit_tx(tx, f"Stake {amount_display} CRUDE")
+        if not result.get("success"):
+            log(f"Stake tx failed: {result}", "ERROR")
+            if tier != "wildcat":
+                log(f"💡 Try DRILLER_TIER=wildcat (only 25M $CRUDE needed)", "WARN")
+            return False
+        log(f"✅ Staked {amount_display} $CRUDE! Hash: {result.get('transactionHash', '?')[:16]}...")
+        await tg_notify(f"⛏ <b>Staked {amount_display} $CRUDE</b> ({tier} tier)")
+        return True
+    except Exception as e:
+        log(f"Stake failed: {e}", "ERROR")
+        if tier != "wildcat":
+            log(f"💡 Insufficient funds? Try DRILLER_TIER=wildcat (25M)", "WARN")
+        return False
+
 
 # ============ DETERMINISTIC DOCUMENT PARSER (NO LLM) ============
 import dataclasses
@@ -1703,7 +1788,14 @@ async def drilling_loop(bankr, coord, solver):
                     await asyncio.sleep(3)
                     continue
             except ForbiddenError as e:
-                log(f"403 Forbidden: {e} — check stake level", "ERROR")
+                log(f"403 Forbidden: {e}", "ERROR")
+                if not getattr(state, '_stake_offered', False):
+                    state._stake_offered = True
+                    staked = await _offer_auto_stake(bankr, coord)
+                    if staked:
+                        log("Stake successful — resuming drilling...")
+                        continue
+                log("Check stake level. Waiting 5 min...", "WARN")
                 await asyncio.sleep(300)
                 continue
             except RateLimitError as e:
