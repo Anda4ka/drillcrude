@@ -59,8 +59,20 @@ DRILLER_DEBUG=true          # подробные логи
 DRILLER_QUIET=true          # минимальный вывод (только accepts и ошибки)
 LLM_BACKEND=zai             # zai (бесплатно) или openrouter
 ZAI_API_KEY=ключ            # только для LLM fallback
-TELEGRAM_BOT_TOKEN=токен    # от @BotFather — уведомления в Telegram
+TELEGRAM_BOT_TOKEN=токен    # уведомления в Telegram (см. ниже)
 TELEGRAM_CHAT_ID=id         # ID чата для уведомлений
+```
+
+**Telegram-уведомления (опционально):**
+
+Бот может отправлять уведомления о гашерах, ошибках и статистике в Telegram.
+
+1. Открой [@BotFather](https://t.me/BotFather) в Telegram, отправь `/newbot`, следуй инструкциям — получишь токен
+2. Напиши своему боту любое сообщение, затем открой `https://api.telegram.org/bot<ТВОЙ_ТОКЕН>/getUpdates` — найди `"chat":{"id":123456789}` — это твой chat ID
+3. Добавь в `.env`:
+```env
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHAT_ID=123456789
 ```
 
 ### 4. Подготовь кошелёк
