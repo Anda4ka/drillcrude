@@ -1336,11 +1336,18 @@ class LLMSolver:
                 return artifact, det_company, det_data, alternates
             else:
                 debug_log("COMPUTE_MISS", {"company": det_company, "constraint": transform_constraint, "data": {k: v for k, v in det_data.items() if not k.startswith('_')}})
+                if not hasattr(self, 'client') or self.client is None:
+                    debug_log("NO_LLM", "LLM disabled, cannot fallback")
+                    return "", "", {}, []
                 validated_answers = {"Q1": det_company}
                 result = self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
                 return result[0], result[1], result[2], []
         else:
             debug_log("DET_FALLBACK_LLM", "Deterministic parser failed, using LLM")
+
+        if not hasattr(self, 'client') or self.client is None:
+            debug_log("NO_LLM", "LLM disabled, deterministic failed — skipping challenge")
+            return "", "", {}, []
 
         # === LLM FALLBACK PATH ===
         q_text = "\n".join(f"Q{i+1}: {q}" for i, q in enumerate(questions))
@@ -1987,10 +1994,11 @@ async def drilling_loop(bankr, coord, solver):
                 if result.get("blowout"):
                     burn_amt = result.get("blowoutBurnAmount", "?")
                     bonus_parts.append(f"🔥BLOWOUT({burn_amt} burned)")
-                    asyncio.create_task(tg_notify(
-                        f"🔥 <b>BLOWOUT!</b> {burn_amt} burned\n"
-                        f"Credits OK. Total: {state.total_credits}"
-                    ))
+                    if str(burn_amt) not in ("0", "0.0", "?"):
+                        asyncio.create_task(tg_notify(
+                            f"🔥 <b>BLOWOUT!</b> {burn_amt} burned\n"
+                            f"Credits OK. Total: {state.total_credits}"
+                        ))
                 jackpot = result.get("jackpot", {})
                 if jackpot.get("triggered"):
                     jp_credits = jackpot.get("bonusCredits", 0)
@@ -2085,10 +2093,12 @@ async def drilling_loop(bankr, coord, solver):
                             if alt_bd.get("depletionBonus"):
                                 alt_bonus.append(f"💥depletion+{alt_bd['depletionBonus']}")
                             if alt_result.get("blowout"):
-                                alt_bonus.append(f"🔥BLOWOUT({alt_result.get('blowoutBurnAmount', '?')} burned)")
-                                asyncio.create_task(tg_notify(
-                                    f"🔥 <b>BLOWOUT!</b> {alt_result.get('blowoutBurnAmount', '?')} burned"
-                                ))
+                                alt_burn = alt_result.get('blowoutBurnAmount', '?')
+                                alt_bonus.append(f"🔥BLOWOUT({alt_burn} burned)")
+                                if str(alt_burn) not in ("0", "0.0", "?"):
+                                    asyncio.create_task(tg_notify(
+                                        f"🔥 <b>BLOWOUT!</b> {alt_burn} burned"
+                                    ))
                             alt_jp = alt_result.get("jackpot", {})
                             if alt_jp.get("triggered"):
                                 alt_bonus.append(f"💎JACKPOT+{alt_jp.get('bonusCredits', 0)}")
@@ -2234,19 +2244,29 @@ async def main():
         missing.append("BANKR_API_KEY")
     if not DRILLER_ADDRESS:
         missing.append("DRILLER_ADDRESS")
-    if LLM_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
-        missing.append("OPENROUTER_API_KEY")
-    if LLM_BACKEND == "zai" and not ZAI_API_KEY:
-        missing.append("ZAI_API_KEY")
     if missing:
         log(f"Missing required config: {', '.join(missing)}", "ERROR")
         log("Copy .env.example to .env and fill in your values", "ERROR")
         return
 
+    # LLM is optional — 95%+ challenges solved deterministically
+    llm_ok = False
+    if LLM_BACKEND == "openrouter" and OPENROUTER_API_KEY:
+        llm_ok = True
+    elif LLM_BACKEND == "zai" and ZAI_API_KEY:
+        llm_ok = True
+
     bankr = BankrClient(BANKR_API_KEY)
     coord = CoordinatorClient(COORDINATOR_URL, DRILLER_ADDRESS, bankr)
-    solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
-    log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
+    if llm_ok:
+        solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
+        log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
+    else:
+        solver = LLMSolver.__new__(LLMSolver)
+        solver.client = None
+        solver.model = None
+        solver.backend = None
+        log("LLM: disabled (no API key) — deterministic solver only")
     log(f"Rig tier: {DRILLER_TIER} ({TIER_CREDITS[DRILLER_TIER]} credits/solve)")
 
     await bankr.init()

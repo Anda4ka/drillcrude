@@ -57,11 +57,13 @@ DRILLER_TIER=platform       # wildcat (25M) / platform (50M) / deepwater (100M)
 ```env
 DRILLER_DEBUG=true          # подробные логи
 DRILLER_QUIET=true          # минимальный вывод (только accepts и ошибки)
-LLM_BACKEND=zai             # zai (бесплатно) или openrouter
-ZAI_API_KEY=ключ            # только для LLM fallback
+LLM_BACKEND=zai             # zai (бесплатно) или openrouter — НЕ обязательно
+ZAI_API_KEY=ключ            # только для LLM fallback (можно не указывать)
 TELEGRAM_BOT_TOKEN=токен    # уведомления в Telegram (см. ниже)
 TELEGRAM_CHAT_ID=id         # ID чата для уведомлений
 ```
+
+> **LLM не обязателен.** Бот решает ~95% challenges детерминистически без AI. Если не указать `ZAI_API_KEY` или `OPENROUTER_API_KEY` — бот просто пропустит оставшиеся ~5% нерешаемых задач.
 
 **Telegram-уведомления (опционально):**
 
