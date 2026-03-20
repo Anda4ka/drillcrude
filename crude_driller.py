@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CRUDE Driller v6.4 - Shallow preference + crash fixes
+CRUDE Driller v6.7 - Solver optimization (Decimal revenue, suffix-stripped alts, async receipts)
 Architecture: 3 async loops (drilling, claiming, monitoring)
 Key improvement: LLM only identifies company, Python computes artifact deterministically
 """
@@ -14,6 +14,8 @@ import random
 import secrets
 import aiohttp
 import sys
+import math
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -730,8 +732,9 @@ _Q_FILTER_YEAR_AFTER_RE = re.compile(r'founded\s+(?:after|since)\s+(\d{4})', re.
 def deterministic_pass1(doc, questions, companies):
     """
     Pure-Python Pass 1: parse doc, answer question, extract data.
-    Returns (company_name, extracted_data_dict, tied_alternates) or (None, None, []) on failure.
+    Returns (company_name, extracted_data_dict, tied_alternates, parsed_companies) or (None, None, [], []) on failure.
     tied_alternates is a list of (company_name, data_dict) for other companies that tied on the question field.
+    parsed_companies is the list of ParsedCompany objects for constraint-field tie detection.
     """
     try:
         debug_log("DET_DOC", doc[:2000])  # Log raw document for debugging
@@ -849,14 +852,44 @@ def deterministic_pass1(doc, questions, companies):
                                      "tied_with": [t[0] for t in tied_alternates]})
         else:
             debug_log("DET_WINNER", {"company": winner.name, "field": field, "value": winner_val, "data": data})
-        return winner.name, data, tied_alternates
+        return winner.name, data, tied_alternates, parsed
 
     except Exception as e:
         debug_log("DET_ERROR", {"error": str(e)})
-        return None, None, []
+        return None, None, [], []
+
+
+def _detect_constraint_field(constraint_text):
+    """Determine which data field a constraint operates on."""
+    c = constraint_text.lower()
+    if "revenue" in c:
+        return "revenue_millions"
+    if "employee" in c:
+        return "employees"
+    if "founding" in c or "founded" in c:
+        return "founded"
+    if "margin" in c:
+        return "margin"
+    return None
 
 
 # ============ LOCAL COMPUTE ENGINE ============
+def _parse_revenue_to_millions_decimal(rev_str):
+    """Parse revenue string to millions using Decimal (exact): '$8.7B' -> 8700 (not 8699)"""
+    if not rev_str or rev_str == "N/A":
+        return None
+    rev_str = rev_str.replace("$", "").replace(",", "").strip()
+    m = re.match(r'([\d.]+)\s*[Bb]', rev_str)
+    if m:
+        return int(Decimal(m.group(1)) * 1000)
+    m = re.match(r'([\d.]+)\s*[Mm]', rev_str)
+    if m:
+        return int(Decimal(m.group(1)))
+    m = re.match(r'(\d+)', rev_str)
+    if m:
+        return int(m.group(1))
+    return None
+
 def _parse_revenue_to_millions(rev_str):
     """Parse revenue string to millions: '$8.5B' -> 8500, '4.4B' -> 4400, '750M' -> 750"""
     if not rev_str or rev_str == "N/A":
@@ -931,16 +964,35 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
             if m:
                 n = int(m.group(1))
                 rev_str = extracted_data.get("revenue") or extracted_data.get("Q1_REVENUE", "")
-                rev = _parse_revenue_to_millions(rev_str)
-                if rev is not None:
-                    primary = str(rev % n)
-                    # Alt: try int() truncation in case coordinator uses that
+                # Primary: Decimal-based (exact arithmetic, no float imprecision)
+                rev_dec = _parse_revenue_to_millions_decimal(rev_str)
+                if rev_dec is not None:
+                    primary = str(rev_dec % n)
                     alts = []
+                    seen = {primary}
+                    # Alt 1: float round()
+                    rev_round = _parse_revenue_to_millions(rev_str)
+                    if rev_round is not None:
+                        a = str(rev_round % n)
+                        if a not in seen:
+                            seen.add(a)
+                            alts.append(a)
+                    # Alt 2: float int() truncation
                     rev_trunc = _parse_revenue_to_millions_trunc(rev_str)
-                    if rev_trunc is not None and rev_trunc != rev:
-                        alt = str(rev_trunc % n)
-                        if alt != primary:
-                            alts.append(alt)
+                    if rev_trunc is not None:
+                        a = str(rev_trunc % n)
+                        if a not in seen:
+                            seen.add(a)
+                            alts.append(a)
+                    # Alt 3: math.ceil on float
+                    rev_str_clean = rev_str.replace("$", "").replace(",", "").strip()
+                    m2 = re.match(r'([\d.]+)\s*[Bb]', rev_str_clean)
+                    if m2:
+                        rev_ceil = math.ceil(float(m2.group(1)) * 1000)
+                        a = str(rev_ceil % n)
+                        if a not in seen:
+                            seen.add(a)
+                            alts.append(a)
                     return primary, "revenue_mod", alts
 
         # "margin ... mod N" or "margin × N" or "margin * N"
@@ -970,12 +1022,30 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
         m = re.search(r'first\s+(\d+)\s+characters?.*reversed', c)
         if m:
             n = int(m.group(1))
+            alts = []
+            seen = set()
             # Primary: strip spaces first, then take first N reversed
             name_ns = company_name.replace(' ', '')
             primary = name_ns[:n][::-1]
-            # Alternate: with spaces (original behavior)
-            alt_with_spaces = company_name[:n][::-1]
-            alts = [alt_with_spaces] if alt_with_spaces != primary else []
+            seen.add(primary)
+            # Alt 1: with spaces
+            alt_ws = company_name[:n][::-1]
+            if alt_ws not in seen:
+                seen.add(alt_ws)
+                alts.append(alt_ws)
+            # Alt 2: suffix stripped (remove Ltd, Inc, Co, Corp, etc.) then no-spaces
+            name_stripped = re.sub(r'\s+(Ltd|Inc|Co|Corp|LLC|LP|Plc|Group|Partners|Holdings|Services|Systems|Engineering)\.?$', '', company_name, flags=re.IGNORECASE)
+            if name_stripped != company_name:
+                ns_stripped = name_stripped.replace(' ', '')
+                alt_s = ns_stripped[:n][::-1]
+                if alt_s not in seen:
+                    seen.add(alt_s)
+                    alts.append(alt_s)
+                # Also with spaces on stripped name
+                alt_sw = name_stripped[:n][::-1]
+                if alt_sw not in seen:
+                    seen.add(alt_sw)
+                    alts.append(alt_sw)
             return primary, "first_n_reversed", alts
 
         # "letters at 1-indexed positions X, Y, Z in the answer company's canonical name"
@@ -986,66 +1056,56 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
             positions = [int(p.strip()) for p in m.group(1).split(',') if p.strip()]
             name_ns = company_name.replace(' ', '')
             alts = []
+            seen = set()
+
+            def _extract_at_positions(name, pos_list):
+                result = []
+                for p in pos_list:
+                    if 1 <= p <= len(name):
+                        result.append(name[p - 1])
+                    else:
+                        return None
+                return ''.join(result) if result else None
 
             # Detect if constraint explicitly says to strip spaces
             strip_spaces = "strip" in c and "space" in c or "space-free" in c or "spacefree" in c
 
             if strip_spaces:
-                # Primary: no-spaces indexing (constraint explicitly says so)
-                result = []
-                valid = True
-                for p in positions:
-                    if 1 <= p <= len(name_ns):
-                        result.append(name_ns[p - 1])
-                    else:
-                        valid = False
-                        break
-                if valid and result:
-                    primary = ''.join(result)
-                    # Alt: with-spaces indexing (in case coordinator disagrees)
-                    result_ws = []
-                    valid_ws = True
-                    for p in positions:
-                        if 1 <= p <= len(company_name):
-                            result_ws.append(company_name[p - 1])
-                        else:
-                            valid_ws = False
-                            break
-                    if valid_ws and result_ws:
-                        alt = ''.join(result_ws)
-                        if alt != primary:
-                            alts.append(alt)
-                    return primary, "letter_positions", alts
+                primary = _extract_at_positions(name_ns, positions)
+                if primary:
+                    seen.add(primary)
+                    # Alt: with-spaces
+                    alt = _extract_at_positions(company_name, positions)
+                    if alt and alt not in seen:
+                        seen.add(alt)
+                        alts.append(alt)
             else:
-                # No explicit strip — "canonical name" means WITH spaces (coordinator default)
-                result_ws = []
-                valid_ws = True
-                for p in positions:
-                    if 1 <= p <= len(company_name):
-                        result_ws.append(company_name[p - 1])
-                    else:
-                        valid_ws = False
-                        break
+                # Primary: WITH spaces (coordinator default for "canonical name")
+                primary = _extract_at_positions(company_name, positions)
+                if primary:
+                    seen.add(primary)
+                    # Alt 1: no-spaces
+                    alt = _extract_at_positions(name_ns, positions)
+                    if alt and alt not in seen:
+                        seen.add(alt)
+                        alts.append(alt)
+                else:
+                    # Fallback to no-spaces if with-spaces is out of bounds
+                    primary = _extract_at_positions(name_ns, positions)
+                    if primary:
+                        seen.add(primary)
 
-                # Also compute no-spaces variant as alt
-                result_ns = []
-                valid_ns = True
-                for p in positions:
-                    if 1 <= p <= len(name_ns):
-                        result_ns.append(name_ns[p - 1])
-                    else:
-                        valid_ns = False
-                        break
-
-                if valid_ws and result_ws:
-                    primary = ''.join(result_ws)
-                    if valid_ns and result_ns:
-                        alt = ''.join(result_ns)
-                        if alt != primary:
+            # Additional alts: suffix-stripped name variants
+            if primary:
+                name_stripped = re.sub(r'\s+(Ltd|Inc|Co|Corp|LLC|LP|Plc|Group|Partners|Holdings|Services|Systems|Engineering)\.?$', '', company_name, flags=re.IGNORECASE)
+                if name_stripped != company_name:
+                    for variant in [name_stripped, name_stripped.replace(' ', '')]:
+                        alt = _extract_at_positions(variant, positions)
+                        if alt and alt not in seen:
+                            seen.add(alt)
                             alts.append(alt)
-                    return primary, "letter_positions", alts
-                elif valid_ns and result_ns:
-                    return ''.join(result_ns), "letter_positions", []
+            if primary:
+                return primary, "letter_positions", alts
 
         # "every Nth letter" (strip spaces, 1-indexed)
         m = re.search(r'every\s+(\d+)(?:th|st|nd|rd)\s+letter', c)
@@ -1171,7 +1231,28 @@ class LLMSolver:
         transform_constraint = self._find_transform_constraint(constraints)
 
         # === TRY FULLY DETERMINISTIC SOLVE (no LLM, ~0.1ms) ===
-        det_company, det_data, tied_alternates = deterministic_pass1(doc, questions, companies)
+        det_company, det_data, tied_alternates, parsed = deterministic_pass1(doc, questions, companies)
+
+        # Add constraint-field tied alternates (companies with same constraint value but different question value)
+        if det_company and transform_constraint and parsed:
+            constraint_field = _detect_constraint_field(transform_constraint)
+            if constraint_field:
+                winner_cval = None
+                for c in parsed:
+                    if c.name == det_company:
+                        winner_cval = getattr(c, constraint_field, None)
+                        break
+                if winner_cval is not None:
+                    existing_names = {det_company} | {t[0] for t in tied_alternates}
+                    constraint_tied = []
+                    for c in parsed:
+                        if c.name not in existing_names and getattr(c, constraint_field, None) == winner_cval:
+                            constraint_tied.append((c.name, _build_company_data(c)))
+                    if constraint_tied:
+                        debug_log("CONSTRAINT_TIED", {"field": constraint_field, "value": winner_cval,
+                                                       "companies": [t[0] for t in constraint_tied]})
+                        tied_alternates.extend(constraint_tied)
+
         if det_company:
             artifact, method, alt_artifacts = compute_artifact_locally(det_company, det_data, transform_constraint)
             if artifact is not None:
@@ -1377,8 +1458,38 @@ Work: 1500 / 7 = 214 remainder 2
         return artifact, primary_company, extracted_data
 
 # ============ SITE PICKER ============
-def pick_best_site(sites, tier="wildcat"):
-    """Pick best site: richness > low depletion"""
+def _site_ev_score(site, featured_region=None):
+    """Calculate expected credit score for a site (higher = better).
+    Considers richness multiplier, featured basin bonus, and depletion."""
+    # Richness category → approximate multiplier midpoint
+    richness_map = {"bonanza": 6.0, "rich": 3.5, "standard": 1.0}
+    r = site.get("richness") or site.get("reserveEstimate", "standard")
+    richness_mult = richness_map.get(str(r).lower(), 1.0)
+
+    # If API provides numeric richnessMultiplier, use it (more precise)
+    if site.get("richnessMultiplier"):
+        try:
+            richness_mult = float(site["richnessMultiplier"])
+        except (ValueError, TypeError):
+            pass
+
+    # Base credits × richness (Platform tier = 2)
+    ev = 2.0 * richness_mult
+
+    # Featured basin bonus (+1 credit)
+    if featured_region and site.get("region", "").lower() == featured_region.lower():
+        ev += 1.0
+
+    # Slight penalty for high depletion (might deplete mid-drill)
+    depl = site.get("depletionPct", 0)
+    if depl > 90:
+        ev *= 0.9  # small penalty, still worth it if rich
+
+    return ev
+
+def pick_best_site(sites, tier="wildcat", featured_region=None, min_richness=None):
+    """Pick best site by expected credit value.
+    min_richness: if set ('rich'/'bonanza'), skip standard sites."""
     if tier == "wildcat":
         allowed = ["shallow"]
     elif tier == "platform":
@@ -1390,22 +1501,34 @@ def pick_best_site(sites, tier="wildcat"):
              if s.get("estimatedDepth") in allowed
              and s.get("depletionPct", 100) < 100]
 
+    # Filter by minimum richness if requested
+    if min_richness:
+        richness_rank = {"bonanza": 0, "rich": 1, "standard": 2}
+        min_rank = richness_rank.get(min_richness, 2)
+        filtered = [s for s in valid
+                    if richness_rank.get(str(s.get("richness") or s.get("reserveEstimate", "standard")).lower(), 2) <= min_rank]
+        if filtered:
+            valid = filtered
+
     if not valid:
         return None
 
-    # Support both possible field names for richness
-    richness_order = {"bonanza": 0, "rich": 1, "standard": 2}
-    # Prefer shallower wells at equal richness — data shows shallow has 15%+ higher hit rate
-    # EV: shallow/bonanza 74.1%×10=7.41 > medium/bonanza 57.1%×12=6.85
-    depth_order = {"shallow": 0, "medium": 1, "deep": 2}
-    def get_richness(s):
-        r = s.get("richness") or s.get("reserveEstimate", "standard")
-        return richness_order.get(str(r).lower(), 2)
-    def get_depth(s):
-        return depth_order.get(s.get("estimatedDepth", "shallow"), 2)
-
-    valid.sort(key=lambda s: (get_richness(s), get_depth(s), s.get("depletionPct", 0)))
+    # Sort by EV score (descending), then by depletion (ascending)
+    valid.sort(key=lambda s: (-_site_ev_score(s, featured_region), s.get("depletionPct", 0)))
     return valid[0]
+
+
+def _count_sites_by_richness(sites, tier="platform"):
+    """Count available sites by richness category."""
+    allowed = {"wildcat": ["shallow"], "platform": ["shallow", "medium"],
+               "deepwater": ["shallow", "medium", "deep"]}.get(tier, ["shallow", "medium"])
+    counts = {"bonanza": 0, "rich": 0, "standard": 0}
+    for s in sites:
+        if s.get("estimatedDepth") in allowed and s.get("depletionPct", 100) < 100:
+            r = str(s.get("richness") or s.get("reserveEstimate", "standard")).lower()
+            if r in counts:
+                counts[r] += 1
+    return counts
 
 # ============ BACKGROUND RECEIPT POSTER ============
 _pending_receipts = asyncio.Queue()
@@ -1444,41 +1567,56 @@ async def drilling_loop(bankr, coord, solver):
     sites_logged = False
     _cached_sites = None
     _sites_ts = 0
+    _featured_region = None  # featured basin from drill response
 
     while True:
         try:
+            # Await any pending receipt task from previous cycle
+            receipt_task = getattr(state, '_receipt_task', None)
+            if receipt_task and not receipt_task.done():
+                try:
+                    await receipt_task
+                except Exception as e:
+                    debug_log("RECEIPT_TASK_ERR", str(e))
+                state._receipt_task = None
+
             # Ensure auth (with expiry check)
             await coord.ensure_auth()
 
-            # Cache sites for 60 seconds to reduce API calls
+            # Refresh sites every 15s (catch new rich/bonanza fast)
             now = time.time()
-            if _cached_sites is None or now - _sites_ts > 60:
+            if _cached_sites is None or now - _sites_ts > 15:
                 sites_data = await coord.get_sites()
                 _cached_sites = sites_data.get("sites", [])
                 epoch_id = sites_data.get("epochId")
                 _sites_ts = now
 
                 if _cached_sites:
+                    counts = _count_sites_by_richness(_cached_sites, "platform")
                     summary = [{"region": s.get("region", "?"), "depth": s.get("estimatedDepth", "?"),
                                 "richness": s.get("richness") or s.get("reserveEstimate", "?"),
                                 "depletion": s.get("depletionPct", "?")} for s in _cached_sites]
-                    debug_log("SITES_AVAILABLE", summary)
+                    debug_log("SITES_AVAILABLE", {"counts": counts, "sites": summary})
                     if not sites_logged:
                         debug_log("SITE_STRUCTURE", _cached_sites[0])
                         sites_logged = True
 
-            # Pick best site
-            site = pick_best_site(_cached_sites, tier="platform")
+            # Pick best site — maximize expected credits
+            site = pick_best_site(_cached_sites, tier="platform", featured_region=_featured_region)
             if not site:
                 log("No valid sites, waiting 30s...")
                 _cached_sites = None  # force refresh next time
                 await asyncio.sleep(30)
                 continue
 
+            # Use whatever best site is available now — no waiting
+            site_richness = str(site.get("richness") or site.get("reserveEstimate", "standard")).lower()
+
             site_id = site["siteId"]
             depth = site.get("estimatedDepth", "?")
             richness = site.get("richness") or site.get("reserveEstimate", "?")
-            log(f"Site: {site.get('region', '?')} ({depth}/{richness}, {site.get('depletionPct', '?')}%)")
+            ev = _site_ev_score(site, _featured_region)
+            log(f"Site: {site.get('region', '?')} ({depth}/{richness}, {site.get('depletionPct', '?')}%) EV={ev:.0f}")
 
             # Small delay before drill (cooldown handled by 429 handler)
             await asyncio.sleep(1)
@@ -1654,6 +1792,18 @@ async def drilling_loop(bankr, coord, solver):
             if challenge_epoch:
                 state.drilled_epochs.add(challenge_epoch)
 
+            # Parse featured basin, missions, streak (Epoch 4+)
+            fr = challenge.get("featuredRegion")
+            if fr and fr != _featured_region:
+                _featured_region = fr
+                log(f"⭐ Featured basin: {fr} (+{challenge.get('featuredRegionBonusCredits', 1)} bonus)")
+            missions = challenge.get("missions")
+            if missions:
+                debug_log("MISSIONS", missions)
+            streak = challenge.get("streak")
+            if streak:
+                debug_log("STREAK", streak)
+
             # Solve
             artifact, company, extracted, alternates = solver.solve(
                 challenge.get("doc", ""),
@@ -1763,20 +1913,41 @@ async def drilling_loop(bankr, coord, solver):
                 state.total_credits += credits
                 state.consecutive_failures = 0
                 state.record_site(depth, richness, True)
-                log(f"✅ ACCEPTED! +{credits} credits (total: {state.total_credits})")
 
+                # Build accept message with bonuses
+                bonus_parts = []
                 if result.get("gusher"):
                     state.gushers += 1
-                    log(f"🎉 GUSHER: {result['gusher']}!")
+                    bonus_parts.append(f"🎉 {result['gusher']}")
+                breakdown = result.get("bonusBreakdown", {})
+                if breakdown.get("featuredBasinBonus"):
+                    bonus_parts.append(f"⭐+{breakdown['featuredBasinBonus']}")
+                if breakdown.get("missionBonus"):
+                    bonus_parts.append(f"🎯+{breakdown['missionBonus']}")
+                if breakdown.get("streakBonus"):
+                    bonus_parts.append(f"🔥streak+{breakdown['streakBonus']}")
+                if breakdown.get("depletionBonus"):
+                    bonus_parts.append(f"💥depletion+{breakdown['depletionBonus']}")
+                # Black Gold events
+                if result.get("blowout"):
+                    burn_amt = result.get("blowoutBurnAmount", "?")
+                    bonus_parts.append(f"🔥BLOWOUT({burn_amt} burned)")
+                jackpot = result.get("jackpot", {})
+                if jackpot.get("triggered"):
+                    jp_credits = jackpot.get("bonusCredits", 0)
+                    jp_reserve = jackpot.get("reserveAmount", "?")
+                    bonus_parts.append(f"💎JACKPOT+{jp_credits}")
+                    log(f"💎💎💎 JACKPOT ERUPTION! +{jp_credits} bonus credits! Reserve: {jp_reserve}")
+                bonus_str = f" ({', '.join(bonus_parts)})" if bonus_parts else ""
+                log(f"✅ ACCEPTED! +{credits} credits{bonus_str} (total: {state.total_credits})")
 
-                # Post receipt INLINE — required before next drill per spec
+                # Post receipt as background task — cooldown is server-side and already ticking
                 tx = result.get("transaction", {})
                 if tx:
-                    await post_receipt_inline(bankr, tx)
+                    state._receipt_task = asyncio.create_task(post_receipt_inline(bankr, tx))
                 else:
                     lot_id = result.get("crudeLotId")
                     log(f"No tx, crudeLotId={lot_id}, full={result}")
-                    # Store lot for receipt fetching during cooldown wait
                     if lot_id:
                         state._pending_lot = lot_id
 
@@ -1837,13 +2008,30 @@ async def drilling_loop(bankr, coord, solver):
                             state.total_credits += credits
                             state.consecutive_failures = 0
                             state.record_site(depth, richness, True)
-                            log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits (total: {state.total_credits})")
+                            alt_bonus = []
                             if alt_result.get("gusher"):
                                 state.gushers += 1
-                                log(f"🎉 GUSHER: {alt_result['gusher']}!")
+                                alt_bonus.append(f"🎉 {alt_result['gusher']}")
+                            alt_bd = alt_result.get("bonusBreakdown", {})
+                            if alt_bd.get("featuredBasinBonus"):
+                                alt_bonus.append(f"⭐+{alt_bd['featuredBasinBonus']}")
+                            if alt_bd.get("missionBonus"):
+                                alt_bonus.append(f"🎯+{alt_bd['missionBonus']}")
+                            if alt_bd.get("streakBonus"):
+                                alt_bonus.append(f"🔥streak+{alt_bd['streakBonus']}")
+                            if alt_bd.get("depletionBonus"):
+                                alt_bonus.append(f"💥depletion+{alt_bd['depletionBonus']}")
+                            if alt_result.get("blowout"):
+                                alt_bonus.append(f"🔥BLOWOUT({alt_result.get('blowoutBurnAmount', '?')} burned)")
+                            alt_jp = alt_result.get("jackpot", {})
+                            if alt_jp.get("triggered"):
+                                alt_bonus.append(f"💎JACKPOT+{alt_jp.get('bonusCredits', 0)}")
+                                log(f"💎💎💎 JACKPOT ERUPTION! +{alt_jp.get('bonusCredits', 0)} bonus credits!")
+                            alt_bonus_str = f" ({', '.join(alt_bonus)})" if alt_bonus else ""
+                            log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits{alt_bonus_str} (total: {state.total_credits})")
                             tx = alt_result.get("transaction", {})
                             if tx:
-                                await post_receipt_inline(bankr, tx)
+                                state._receipt_task = asyncio.create_task(post_receipt_inline(bankr, tx))
                             state.save()
                             retry_accepted = True
                             break
@@ -1940,7 +2128,7 @@ async def monitor_loop(bankr, coord):
 # ============ MAIN ============
 async def main():
     log("=" * 60)
-    log("CRUDE Driller v6.4 - Shallow preference + crash fixes")
+    log("CRUDE Driller v6.7 - Solver optimization (Decimal revenue, suffix-stripped alts, async receipts)")
     log("=" * 60)
     if DRILLER_DEBUG:
         log("DEBUG MODE ENABLED - verbose logging to crude_debug.log")
