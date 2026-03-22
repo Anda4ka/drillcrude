@@ -136,6 +136,19 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 | `Miner is not eligible` | Нет стейка — бот предложит застейкать автоматически. Или застейкай на drillcrude.com |
 | `Auth 502` | Координатор временно лежит. Бот retry-ит сам |
 | `Trace must reference the constraint company` | Не та компания — alt-retry попробует другие |
+| `over rate limit` / `RPC rate limited` | Координатор перегружен — бот ждёт 45 сек и retry |
+
+## Rig Contracts (Commitments)
+
+Можно залочить эпохи и получать бонус к кредитам **без блокировки токенов**:
+
+| Срок | Бонус к кредитам | Black Gold шанс |
+|------|-----------------|-----------------|
+| 1 эпоха | +8% | 1.15x |
+| 3 эпохи | +25% | 1.50x |
+| 5 эпох | +50% | 1.90x |
+
+Регистрация через [drillcrude.com](https://www.drillcrude.com) или API: `POST /v1/commitments/enroll`.
 
 ## Версии
 

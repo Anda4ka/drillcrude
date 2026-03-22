@@ -1864,6 +1864,10 @@ async def drilling_loop(bankr, coord, solver):
                     _cached_sites = None
                     await asyncio.sleep(3)
                     continue
+                elif "rate limit" in err_lower:
+                    log("Coordinator RPC rate limited — waiting 45s...", "WARN")
+                    await asyncio.sleep(45)
+                    continue
                 log(f"Drill error: {err}", "WARN")
                 if "active drill" in err_lower:
                     cid = challenge.get("challengeId", "")
