@@ -1,4 +1,4 @@
-# CRUDE Driller v6.7
+# CRUDE Driller v6.8
 
 Автоматический бот для майнинга $CRUDE токенов на Base через [drillcrude.com](https://www.drillcrude.com).
 
@@ -71,6 +71,20 @@ TELEGRAM_CHAT_ID=id         # ID чата для уведомлений
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_CHAT_ID=123456789
 ```
+
+**Несколько кошельков (опционально):**
+
+Можно запустить 2+ кошелька из одного процесса. Добавь в `.env`:
+```env
+BANKR_API_KEY_1=ключ_первого_кошелька
+DRILLER_ADDRESS_1=0xAAA...
+DRILLER_TIER_1=platform
+
+BANKR_API_KEY_2=ключ_второго_кошелька
+DRILLER_ADDRESS_2=0xBBB...
+DRILLER_TIER_2=wildcat
+```
+Простой `BANKR_API_KEY` при этом игнорируется. У каждого кошелька свой файл состояния.
 
 ### 4. Подготовь кошелёк
 
@@ -154,6 +168,7 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 
 | Версия | Что нового |
 |---|---|
+| v6.8 | Multi-wallet: несколько кошельков из одного процесса |
 | v6.7 | Decimal-парсинг revenue, suffix-stripped name alts, async receipts, настраиваемый тир (`DRILLER_TIER`) |
 | v6.6 | Black Gold events (blowout/jackpot), Epoch 4 фичи, bonus tracking |
 | v6.5 | Новый trace формат, inline receipts, 30s cooldown, alt-retry работает |

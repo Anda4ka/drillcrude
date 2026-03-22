@@ -15,9 +15,11 @@ import secrets
 import aiohttp
 import sys
 import math
+import dataclasses
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List, Tuple
 
 # Load .env file if exists
 _env_file = Path(__file__).parent / ".env"
@@ -107,6 +109,48 @@ TIER_STAKE_WEI = {
     "deepwater":"100000000000000000000000000",
 }
 TIER_STAKE_DISPLAY = {"wildcat": "25M", "platform": "50M", "deepwater": "100M"}
+
+# ============ MULTI-WALLET CONFIG ============
+@dataclasses.dataclass
+class WalletConfig:
+    wallet_id: int
+    bankr_api_key: str
+    driller_address: str
+    driller_tier: str
+    tag: str          # "W1", "W2" or short addr
+    state_file: Path
+
+def _load_wallet_configs():
+    """Load wallet configs from env. Supports multi-wallet (BANKR_API_KEY_1, _2, ...)
+    or single-wallet (legacy BANKR_API_KEY)."""
+    wallets = []
+    n = 1
+    while True:
+        key = os.getenv(f"BANKR_API_KEY_{n}", "")
+        if not key:
+            break
+        addr = os.getenv(f"DRILLER_ADDRESS_{n}", "")
+        tier = os.getenv(f"DRILLER_TIER_{n}", "platform").lower().strip()
+        if tier not in TIER_CREDITS:
+            tier = "platform"
+        tag = f"W{n}"
+        # Per-wallet state file
+        addr_short = addr[-8:].lower() if len(addr) >= 8 else f"w{n}"
+        state_file = SCRIPT_DIR / f"crude_driller_state_{addr_short}.json"
+        wallets.append(WalletConfig(
+            wallet_id=n, bankr_api_key=key, driller_address=addr,
+            driller_tier=tier, tag=tag, state_file=state_file
+        ))
+        n += 1
+
+    if not wallets:
+        # Legacy single-wallet mode
+        wallets.append(WalletConfig(
+            wallet_id=0, bankr_api_key=BANKR_API_KEY,
+            driller_address=DRILLER_ADDRESS, driller_tier=DRILLER_TIER,
+            tag="", state_file=STATE_FILE  # original filename for backward compat
+        ))
+    return wallets
 
 # ============ LOGGING (buffered I/O) ============
 LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
@@ -260,7 +304,8 @@ async def backoff_sleep(attempt, base=2.0, cap=60.0):
 
 # ============ STATE ============
 class State:
-    def __init__(self):
+    def __init__(self, state_file=None):
+        self._state_file = state_file or STATE_FILE
         self.drilled_epochs = set()
         self.total_solves = 0
         self.total_failures = 0
@@ -273,9 +318,9 @@ class State:
         self.load()
 
     def load(self):
-        if STATE_FILE.exists():
+        if self._state_file.exists():
             try:
-                data = json.loads(STATE_FILE.read_text())
+                data = json.loads(self._state_file.read_text())
                 self.drilled_epochs = set(data.get("drilled_epochs", []))
                 self.total_solves = data.get("total_solves", 0)
                 self.total_failures = data.get("total_failures", 0)
@@ -308,11 +353,12 @@ class State:
             "site_stats": self.site_stats
         }
         try:
-            STATE_FILE.write_text(json.dumps(data, separators=(',', ':')))
+            self._state_file.write_text(json.dumps(data, separators=(',', ':')))
         except (PermissionError, OSError):
             pass
 
-state = State()
+# state is created per-wallet in main(), not globally
+state = None  # type: Optional[State]
 
 # ============ BANKR CLIENT ============
 class BankrClient:
@@ -540,9 +586,9 @@ class CoordinatorClient:
             return await resp.json()
 
 
-async def _offer_auto_stake(bankr, coord):
+async def _offer_auto_stake(bankr, coord, tier=None):
     """Called on first 403 in drilling_loop — offer interactive staking."""
-    tier = DRILLER_TIER
+    tier = tier or DRILLER_TIER
     amount_display = TIER_STAKE_DISPLAY[tier]
     amount_wei = TIER_STAKE_WEI[tier]
 
@@ -605,8 +651,6 @@ async def _offer_auto_stake(bankr, coord):
 
 
 # ============ DETERMINISTIC DOCUMENT PARSER (NO LLM) ============
-import dataclasses
-from typing import Optional, List, Tuple
 
 @dataclasses.dataclass
 class CompanyData:
@@ -1605,7 +1649,7 @@ Work: 1500 / 7 = 214 remainder 2
         return artifact, primary_company, extracted_data
 
 # ============ SITE PICKER ============
-def _site_ev_score(site, featured_region=None):
+def _site_ev_score(site, featured_region=None, tier=None):
     """Calculate expected credit score for a site (higher = better).
     Considers richness multiplier, featured basin bonus, and depletion."""
     # Richness category → approximate multiplier midpoint
@@ -1621,7 +1665,8 @@ def _site_ev_score(site, featured_region=None):
             pass
 
     # Base credits × richness (tier-dependent)
-    ev = float(TIER_CREDITS.get(DRILLER_TIER, 2)) * richness_mult
+    _tier = tier or DRILLER_TIER
+    ev = float(TIER_CREDITS.get(_tier, 2)) * richness_mult
 
     # Featured basin bonus (+1 credit)
     if featured_region and site.get("region", "").lower() == featured_region.lower():
@@ -1661,7 +1706,7 @@ def pick_best_site(sites, tier="wildcat", featured_region=None, min_richness=Non
         return None
 
     # Sort by EV score (descending), then by depletion (ascending)
-    valid.sort(key=lambda s: (-_site_ev_score(s, featured_region), s.get("depletionPct", 0)))
+    valid.sort(key=lambda s: (-_site_ev_score(s, featured_region, tier=tier), s.get("depletionPct", 0)))
     return valid[0]
 
 
@@ -1706,9 +1751,10 @@ async def post_receipt_inline(bankr, tx, desc="CRUDE drilling receipt"):
     return False
 
 # ============ MAIN LOOPS ============
-async def drilling_loop(bankr, coord, solver):
+async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
     """Drilling loop: drill → solve → submit → receipt (inline) → repeat"""
-    log("Drilling loop started (inline receipts, ~4s/cycle)")
+    _tag = f"[{tag}] " if tag else ""
+    log(f"{_tag}Drilling loop started (inline receipts, ~4s/cycle)")
     retry_attempt = 0
     drill_delay = DRILL_DELAY_INIT  # adaptive delay
     sites_logged = False
@@ -1739,7 +1785,7 @@ async def drilling_loop(bankr, coord, solver):
                 _sites_ts = now
 
                 if _cached_sites:
-                    counts = _count_sites_by_richness(_cached_sites, DRILLER_TIER)
+                    counts = _count_sites_by_richness(_cached_sites, tier)
                     summary = [{"region": s.get("region", "?"), "depth": s.get("estimatedDepth", "?"),
                                 "richness": s.get("richness") or s.get("reserveEstimate", "?"),
                                 "depletion": s.get("depletionPct", "?")} for s in _cached_sites]
@@ -1749,7 +1795,7 @@ async def drilling_loop(bankr, coord, solver):
                         sites_logged = True
 
             # Pick best site — maximize expected credits
-            site = pick_best_site(_cached_sites, tier=DRILLER_TIER, featured_region=_featured_region)
+            site = pick_best_site(_cached_sites, tier=tier, featured_region=_featured_region)
             if not site:
                 log("No valid sites, waiting 30s...")
                 _cached_sites = None  # force refresh next time
@@ -1762,8 +1808,8 @@ async def drilling_loop(bankr, coord, solver):
             site_id = site["siteId"]
             depth = site.get("estimatedDepth", "?")
             richness = site.get("richness") or site.get("reserveEstimate", "?")
-            ev = _site_ev_score(site, _featured_region)
-            log(f"Site: {site.get('region', '?')} ({depth}/{richness}, {site.get('depletionPct', '?')}%) EV={ev:.0f}")
+            ev = _site_ev_score(site, _featured_region, tier=tier)
+            log(f"{_tag}Site: {site.get('region', '?')} ({depth}/{richness}, {site.get('depletionPct', '?')}%) EV={ev:.0f}")
 
             # Small delay before drill (cooldown handled by 429 handler)
             await asyncio.sleep(1)
@@ -1791,7 +1837,7 @@ async def drilling_loop(bankr, coord, solver):
                 log(f"403 Forbidden: {e}", "ERROR")
                 if not getattr(state, '_stake_offered', False):
                     state._stake_offered = True
-                    staked = await _offer_auto_stake(bankr, coord)
+                    staked = await _offer_auto_stake(bankr, coord, tier)
                     if staked:
                         log("Stake successful — resuming drilling...")
                         continue
@@ -2106,7 +2152,7 @@ async def drilling_loop(bankr, coord, solver):
                         f"+{jp_credits} bonus credits! Reserve: {jp_reserve}"
                     ))
                 bonus_str = f" ({', '.join(bonus_parts)})" if bonus_parts else ""
-                log(f"✅ ACCEPTED! +{credits} credits{bonus_str} (total: {state.total_credits})")
+                log(f"{_tag}✅ ACCEPTED! +{credits} credits{bonus_str} (total: {state.total_credits})")
 
                 # Post receipt as background task — cooldown is server-side and already ticking
                 tx = result.get("transaction", {})
@@ -2121,7 +2167,7 @@ async def drilling_loop(bankr, coord, solver):
                 state.save()
             else:
                 reason = result.get("reason", str(result))
-                log(f"❌ REJECTED: {reason} (artifact: '{artifact}', company: {company})")
+                log(f"{_tag}❌ REJECTED: {reason} (artifact: '{artifact}', company: {company})")
                 debug_log("REJECTION", {"reason": reason, "artifact": artifact, "company": company, "full_result": result})
 
                 # === RETRY WITH ALTERNATES ===
@@ -2203,7 +2249,7 @@ async def drilling_loop(bankr, coord, solver):
                                     f"💎 <b>JACKPOT!</b> +{alt_jp.get('bonusCredits', 0)} bonus credits!"
                                 ))
                             alt_bonus_str = f" ({', '.join(alt_bonus)})" if alt_bonus else ""
-                            log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits{alt_bonus_str} (total: {state.total_credits})")
+                            log(f"{_tag}✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits{alt_bonus_str} (total: {state.total_credits})")
                             tx = alt_result.get("transaction", {})
                             if tx:
                                 state._receipt_task = asyncio.create_task(post_receipt_inline(bankr, tx))
@@ -2242,9 +2288,10 @@ async def drilling_loop(bankr, coord, solver):
             await backoff_sleep(retry_attempt, base=5.0)
             retry_attempt = min(retry_attempt + 1, 5)
 
-async def claim_loop(bankr, coord):
+async def claim_loop(bankr, coord, state, tag=""):
     """Claim rewards every 30 min"""
-    log("Claim loop started")
+    _tag = f"[{tag}] " if tag else ""
+    log(f"{_tag}Claim loop started")
 
     while True:
         try:
@@ -2279,9 +2326,10 @@ async def claim_loop(bankr, coord):
         except Exception as e:
             log(f"Claim error: {e}", "ERROR")
 
-async def monitor_loop(bankr, coord):
+async def monitor_loop(bankr, coord, state, tag=""):
     """Monitor stats every 5 min"""
-    log("Monitor loop started")
+    _tag = f"[{tag}] " if tag else ""
+    log(f"{_tag}Monitor loop started")
     tg_report_count = 0
 
     while True:
@@ -2295,7 +2343,7 @@ async def monitor_loop(bankr, coord):
             total = state.total_solves + state.total_failures
             rate = (state.total_solves / total * 100) if total > 0 else 0
 
-            log(f"Stats: {state.total_solves}/{total} ({rate:.1f}%) | {state.total_credits} credits | {state.gushers} gushers | {hours}h{mins}m")
+            log(f"{_tag}Stats: {state.total_solves}/{total} ({rate:.1f}%) | {state.total_credits} credits | {state.gushers} gushers | {hours}h{mins}m")
 
             # Telegram hourly report
             tg_report_count += 1
@@ -2329,31 +2377,40 @@ async def monitor_loop(bankr, coord):
 # ============ MAIN ============
 async def main():
     log("=" * 60)
-    log("CRUDE Driller v6.7 - Solver optimization (Decimal revenue, suffix-stripped alts, async receipts)")
+    log("CRUDE Driller v6.8 - Multi-wallet support")
     log("=" * 60)
     if DRILLER_DEBUG:
         log("DEBUG MODE ENABLED - verbose logging to crude_debug.log")
 
-    # Validate required config
-    missing = []
-    if not BANKR_API_KEY:
-        missing.append("BANKR_API_KEY")
-    if not DRILLER_ADDRESS:
-        missing.append("DRILLER_ADDRESS")
-    if missing:
-        log(f"Missing required config: {', '.join(missing)}", "ERROR")
-        log("Copy .env.example to .env and fill in your values", "ERROR")
-        return
+    # Load wallet configs (multi or single)
+    wallets = _load_wallet_configs()
 
-    # LLM is optional — 95%+ challenges solved deterministically
+    # Validate
+    for w in wallets:
+        missing = []
+        if not w.bankr_api_key:
+            missing.append(f"BANKR_API_KEY{'_'+str(w.wallet_id) if w.wallet_id else ''}")
+        if not w.driller_address:
+            missing.append(f"DRILLER_ADDRESS{'_'+str(w.wallet_id) if w.wallet_id else ''}")
+        if missing:
+            log(f"Missing required config: {', '.join(missing)}", "ERROR")
+            log("Copy .env.example to .env and fill in your values", "ERROR")
+            return
+
+    if len(wallets) > 1:
+        log(f"Multi-wallet mode: {len(wallets)} wallets")
+    for w in wallets:
+        tag = f"[{w.tag}] " if w.tag else ""
+        addr = w.driller_address
+        log(f"{tag}Wallet: {addr[:8]}...{addr[-4:]} | {w.driller_tier} ({TIER_CREDITS[w.driller_tier]} cr/solve)")
+
+    # LLM is optional — 95%+ challenges solved deterministically (shared across wallets)
     llm_ok = False
     if LLM_BACKEND == "openrouter" and OPENROUTER_API_KEY:
         llm_ok = True
     elif LLM_BACKEND == "zai" and ZAI_API_KEY:
         llm_ok = True
 
-    bankr = BankrClient(BANKR_API_KEY)
-    coord = CoordinatorClient(COORDINATOR_URL, DRILLER_ADDRESS, bankr)
     if llm_ok:
         solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
         log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
@@ -2363,33 +2420,55 @@ async def main():
         solver.model = None
         solver.backend = None
         log("LLM: disabled (no API key) — deterministic solver only")
-    log(f"Rig tier: {DRILLER_TIER} ({TIER_CREDITS[DRILLER_TIER]} credits/solve)")
 
-    await bankr.init()
-    await coord.init()
     await tg_init()
 
-    # Initial auth (retry until success)
-    for attempt in range(10):
-        try:
-            await coord.ensure_auth()
-            break
-        except Exception as e:
-            log(f"Auth attempt {attempt+1} failed: {e}", "ERROR")
-            if attempt < 9:
-                wait = min(30, 5 * (attempt + 1))
-                log(f"Retrying in {wait}s...", "WARN")
-                await asyncio.sleep(wait)
-            else:
-                log("Auth failed after 10 attempts, exiting", "ERROR")
-                return
+    # Initialize all wallet instances
+    instances = []  # (bankr, coord, wstate, wcfg)
+    tasks = []
 
+    for wcfg in wallets:
+        bankr = BankrClient(wcfg.bankr_api_key)
+        coord = CoordinatorClient(COORDINATOR_URL, wcfg.driller_address, bankr)
+        wstate = State(wcfg.state_file)
+
+        await bankr.init()
+        await coord.init()
+
+        # Initial auth (retry until success)
+        tag_prefix = f"[{wcfg.tag}] " if wcfg.tag else ""
+        auth_ok = False
+        for attempt in range(10):
+            try:
+                await coord.ensure_auth()
+                auth_ok = True
+                break
+            except Exception as e:
+                log(f"{tag_prefix}Auth attempt {attempt+1} failed: {e}", "ERROR")
+                if attempt < 9:
+                    wait = min(30, 5 * (attempt + 1))
+                    log(f"{tag_prefix}Retrying in {wait}s...", "WARN")
+                    await asyncio.sleep(wait)
+        if not auth_ok:
+            log(f"{tag_prefix}Auth failed after 10 attempts, skipping wallet", "ERROR")
+            await bankr.close()
+            await coord.close()
+            continue
+
+        instances.append((bankr, coord, wstate, wcfg))
+        tasks.append(drilling_loop(bankr, coord, solver, wstate, wcfg.driller_tier, wcfg.tag))
+        tasks.append(claim_loop(bankr, coord, wstate, wcfg.tag))
+        tasks.append(monitor_loop(bankr, coord, wstate, wcfg.tag))
+
+    if not instances:
+        log("No wallets initialized, exiting", "ERROR")
+        return
+
+    wallet_tags = ", ".join(f"{w.driller_address[:8]}...{w.driller_address[-4:]}" for _, _, _, w in instances)
     await tg_notify(
-        f"🟢 <b>CRUDE Driller v6.7 started</b>\n"
-        f"⛏ {DRILLER_ADDRESS[:8]}...{DRILLER_ADDRESS[-4:]}"
+        f"🟢 <b>CRUDE Driller v6.8 started</b>\n"
+        f"⛏ {len(instances)} wallet(s): {wallet_tags}"
     )
-
-    shutdown_event = asyncio.Event()
 
     async def _guarded(coro):
         try:
@@ -2398,28 +2477,30 @@ async def main():
             pass
 
     try:
-        await asyncio.gather(
-            _guarded(drilling_loop(bankr, coord, solver)),
-            _guarded(claim_loop(bankr, coord)),
-            _guarded(monitor_loop(bankr, coord))
-        )
+        await asyncio.gather(*[_guarded(t) for t in tasks])
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         log("Shutting down...")
-        runtime = int(time.time() - state.start_time)
+        for bankr, coord, wstate, wcfg in instances:
+            tag_prefix = f"[{wcfg.tag}] " if wcfg.tag else ""
+            runtime = int(time.time() - wstate.start_time)
+            log(f"{tag_prefix}Final: {wstate.total_solves}/{wstate.total_solves + wstate.total_failures} | {wstate.total_credits} credits")
+            wstate.save(force=True)
+            await bankr.close()
+            await coord.close()
+
+        # Aggregate stats for telegram
+        total_credits = sum(ws.total_credits for _, _, ws, _ in instances)
+        total_solves = sum(ws.total_solves for _, _, ws, _ in instances)
+        runtime = int(time.time() - instances[0][2].start_time) if instances else 0
         await tg_notify(
             f"🔴 <b>Driller stopped</b> — {runtime//3600}h{(runtime%3600)//60}m\n"
-            f"💰 {state.total_credits} credits | {state.total_solves} solves"
+            f"💰 {total_credits} credits | {total_solves} solves | {len(instances)} wallet(s)"
         )
         await tg_close()
-        state.save(force=True)
         _flush_log()
         _flush_debug()
-        await bankr.close()
-        await coord.close()
-        log(f"Final: {state.total_solves}/{state.total_solves + state.total_failures} | {state.total_credits} credits")
-        _flush_log()
         PID_FILE.unlink(missing_ok=True)
 
 def _run():
