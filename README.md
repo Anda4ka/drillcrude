@@ -1,4 +1,4 @@
-# CRUDE Driller v6.8
+# CRUDE Driller v6.9
 
 Автоматический бот для майнинга $CRUDE токенов на Base через [drillcrude.com](https://www.drillcrude.com).
 
@@ -123,10 +123,14 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 
 ## Что бот делает автоматически
 
-- Выбирает лучший сайт (bonanza > rich > standard)
+- Выбирает лучший сайт (bonanza > rich > standard, приоритет featured basin)
 - Получает challenge, решает его, отправляет ответ
 - При реджекте — пробует альтернативные варианты
-- Постит receipt on-chain (обязательно для получения наград)
+- **Receipt worker** — отдельный воркер постит receipts on-chain:
+  - Всегда запрашивает **свежий calldata** у координатора (не использует кешированные данные)
+  - Проверяет статус через `/v1/refine/status` перед постом
+  - Автоматически закрывает **gap-рецепты** через цепочку `nextPendingCrudeLotId`
+  - Если рецепты были потеряны (Bankr вернул success, но TX ревёртнулся) — воркер пройдёт по всем пропущенным
 - Ждёт cooldown 30 сек и повторяет
 - Каждые 30 мин проверяет и клеймит награды за завершённые эпохи
 - Логирует статистику каждые 5 мин
@@ -139,7 +143,8 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 | `claim_now.py` | Ручной клейм наград |
 | `.env` | Конфигурация (**не коммитить!**) |
 | `crude_driller.log` | Лог работы |
-| `crude_driller_state.json` | Сохранённый прогресс |
+| `crude_driller_state.json` | Сохранённый прогресс (single-wallet) |
+| `crude_driller_state_{addr}.json` | Прогресс per wallet (multi-wallet) |
 
 ## Частые проблемы
 
@@ -151,6 +156,8 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 | `Auth 502` | Координатор временно лежит. Бот retry-ит сам |
 | `Trace must reference the constraint company` | Не та компания — alt-retry попробует другие |
 | `over rate limit` / `RPC rate limited` | Координатор перегружен — бот ждёт 45 сек и retry |
+| `InvalidSolveIndex` | Gap в on-chain рецептах — receipt worker автоматически закроет через `nextPendingCrudeLotId` |
+| `Gap receipt: coordinator says post ... first` | Нормально — воркер проходит по пропущенным рецептам перед вашими |
 
 ## Rig Contracts (Commitments)
 
@@ -168,6 +175,7 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 
 | Версия | Что нового |
 |---|---|
+| v6.9 | Receipt lifecycle fix: свежий calldata, автоматическое закрытие gap через `nextPendingCrudeLotId`, dedicated receipt worker |
 | v6.8 | Multi-wallet: несколько кошельков из одного процесса |
 | v6.7 | Decimal-парсинг revenue, suffix-stripped name alts, async receipts, настраиваемый тир (`DRILLER_TIER`) |
 | v6.6 | Black Gold events (blowout/jackpot), Epoch 4 фичи, bonus tracking |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CRUDE Driller v6.7 - Solver optimization (Decimal revenue, suffix-stripped alts, async receipts)
-Architecture: 3 async loops (drilling, claiming, monitoring)
+CRUDE Driller v6.9 - Receipt lifecycle fix (fresh calldata, gap recovery via nextPendingCrudeLotId)
+Architecture: 4 async loops per wallet (drilling, claiming, monitoring, receipt_worker)
 Key improvement: LLM only identifies company, Python computes artifact deterministically
 """
 
@@ -24,7 +24,7 @@ from typing import Optional, List, Tuple
 # Load .env file if exists
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
-    for _line in _env_file.read_text().splitlines():
+    for _line in _env_file.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
@@ -314,6 +314,8 @@ class State:
         self.consecutive_failures = 0
         self._no_cid_attempts = 0
         self.site_stats = {}  # {"shallow/standard": {"accept": 0, "reject": 0}, ...}
+        self.pending_receipts = []  # [{crudeLotId, solveIndex, epochId, tx, status, attempts, created_at}]
+        self.receipt_consecutive_failures = 0
         self.start_time = time.time()
         self.load()
 
@@ -327,7 +329,9 @@ class State:
                 self.total_credits = data.get("total_credits", 0)
                 self.gushers = data.get("gushers", 0)
                 self.site_stats = data.get("site_stats", {})
-                log(f"State loaded: {self.total_solves} solves, {self.total_credits} credits")
+                self.pending_receipts = data.get("pending_receipts", [])
+                pending_count = len([r for r in self.pending_receipts if r.get("status") == "pending"])
+                log(f"State loaded: {self.total_solves} solves, {self.total_credits} credits, {pending_count} pending receipts")
             except Exception as e:
                 log(f"State load error: {e}", "WARN")
 
@@ -336,6 +340,55 @@ class State:
         if key not in self.site_stats:
             self.site_stats[key] = {"accept": 0, "reject": 0}
         self.site_stats[key]["accept" if accepted else "reject"] += 1
+
+    def add_pending_receipt(self, lot_id, tx=None, solve_index=None, epoch_id=None):
+        """Save receipt for ordered posting. Deduplicates by lot_id.
+        tx is NOT stored — worker always fetches fresh calldata."""
+        for r in self.pending_receipts:
+            if r.get("crudeLotId") == lot_id:
+                return  # already tracked
+        self.pending_receipts.append({
+            "crudeLotId": lot_id,
+            "solveIndex": solve_index,
+            "epochId": epoch_id,
+            "status": "pending",
+            "attempts": 0,
+            "created_at": int(time.time()),
+        })
+        # Sort by solveIndex (None sorts last)
+        self.pending_receipts.sort(key=lambda r: r.get("solveIndex") or 999999999)
+        self.save(force=True)
+
+    def mark_receipt_posted(self, lot_id):
+        for r in self.pending_receipts:
+            if r.get("crudeLotId") == lot_id:
+                r["status"] = "posted"
+                r["tx"] = None  # free memory, no longer needed
+                break
+        self.receipt_consecutive_failures = 0
+        # Prune old posted receipts (keep last 20)
+        posted = [r for r in self.pending_receipts if r["status"] == "posted"]
+        if len(posted) > 20:
+            oldest = posted[:-20]
+            self.pending_receipts = [r for r in self.pending_receipts if r not in oldest]
+
+    def mark_receipt_failed(self, lot_id, error=""):
+        for r in self.pending_receipts:
+            if r.get("crudeLotId") == lot_id:
+                r["attempts"] = r.get("attempts", 0) + 1
+                r["last_error"] = str(error)[:200]
+                break
+        self.receipt_consecutive_failures += 1
+
+    def get_next_pending_receipt(self):
+        """Get the lowest-solveIndex pending receipt."""
+        for r in self.pending_receipts:
+            if r.get("status") == "pending" and r.get("attempts", 0) < 10:
+                return r
+        return None
+
+    def get_pending_receipt_count(self):
+        return len([r for r in self.pending_receipts if r.get("status") == "pending"])
 
     _SAVE_INTERVAL = 30  # save to disk max once per 30 seconds
 
@@ -350,7 +403,8 @@ class State:
             "total_failures": self.total_failures,
             "total_credits": self.total_credits,
             "gushers": self.gushers,
-            "site_stats": self.site_stats
+            "site_stats": self.site_stats,
+            "pending_receipts": self.pending_receipts,
         }
         try:
             self._state_file.write_text(json.dumps(data, separators=(',', ':')))
@@ -416,6 +470,31 @@ class BankrClient:
                     await asyncio.sleep(10)
                 else:
                     raise
+
+    async def get_address(self):
+        """Get wallet address associated with this API key"""
+        try:
+            async with self.session.post(
+                f"{self.base_url}/agent/prompt",
+                json={"prompt": "what is my wallet address on base?"},
+                headers={"Content-Type": "application/json", "X-API-Key": self.api_key}
+            ) as resp:
+                data = await resp.json()
+                job_id = data.get("jobId")
+            for _ in range(15):
+                await asyncio.sleep(2)
+                async with self.session.get(
+                    f"{self.base_url}/agent/job/{job_id}",
+                    headers={"X-API-Key": self.api_key}
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("status") == "completed":
+                        text = data.get("response", "")
+                        match = re.search(r'0x[0-9a-fA-F]{40}', text)
+                        return match.group(0) if match else None
+            return None
+        except Exception:
+            return None
 
     async def get_balances(self):
         async with self.session.post(
@@ -567,6 +646,33 @@ class CoordinatorClient:
             data = await resp.json()
             self._check_status(resp.status, data, resp.headers)
             return data
+
+    async def get_receipt_calldata(self, lot_id):
+        """Fetch signed receipt tx for a lot that needs on-chain posting."""
+        try:
+            async with self.session.get(
+                f"{self.url}/v1/receipt-calldata?crudeLotId={lot_id}&miner={self.driller}",
+                headers=self._headers()
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("transaction")
+                return None
+        except Exception:
+            return None
+
+    async def get_refine_status(self, lot_id):
+        """Check receipt status: signed_not_submitted / submitted / etc."""
+        try:
+            async with self.session.get(
+                f"{self.url}/v1/refine/status?crudeLotId={lot_id}",
+                headers=self._headers()
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception:
+            return None
 
     async def get_claim_calldata(self, epochs):
         epoch_str = ",".join(map(str, epochs))
@@ -1722,26 +1828,95 @@ def _count_sites_by_richness(sites, tier="platform"):
                 counts[r] += 1
     return counts
 
-# ============ BACKGROUND RECEIPT POSTER ============
-_pending_receipts = asyncio.Queue()
+# ============ RECEIPT POSTING ============
 _receipt_cooldown = int(os.getenv("RECEIPT_COOLDOWN", "30"))  # seconds between receipt tx (saves gas)
+INVALID_SOLVE_INDEX_SELECTOR = "80047d46"  # InvalidSolveIndex() custom error
 
-async def post_receipt_inline(bankr, tx, desc="CRUDE drilling receipt"):
+async def _decode_receipt_solve_index(tx_data):
+    """Decode solveIndex from submitReceipt tx data for diagnostics."""
+    try:
+        if not tx_data or len(tx_data) < 10:
+            return None
+        raw = tx_data[10:] if tx_data.startswith("0x") else tx_data[8:]
+        data_bytes = bytes.fromhex(raw)
+        if len(data_bytes) < 192:
+            return None
+        # submitReceipt((address,uint64,uint64,bytes32,bytes32,uint32,bytes32),bytes)
+        # Static tuple is encoded INLINE (no offset pointer):
+        #   Bytes 0-31:   miner (address, left-padded)
+        #   Bytes 32-63:  epochId (uint64)
+        #   Bytes 64-95:  solveIndex (uint64)
+        #   Bytes 96-127: challengeId (bytes32)
+        #   Bytes 128-159: siteId (bytes32)
+        #   Bytes 160-191: refinedCredits (uint32)
+        #   Bytes 192-223: requestNonce (bytes32)
+        epoch_id = int.from_bytes(data_bytes[32:64], 'big')
+        solve_index = int.from_bytes(data_bytes[64:96], 'big')
+        credits = int.from_bytes(data_bytes[160:192], 'big')
+        return {"epochId": epoch_id, "solveIndex": solve_index, "credits": credits}
+    except Exception:
+        return None
+
+
+async def post_receipt_inline(bankr, tx, desc="CRUDE drilling receipt", miner_addr=None):
     """Post receipt on-chain and wait for confirmation — unlocks next drill"""
+    # Decode receipt solveIndex for diagnostics
+    receipt_info = await _decode_receipt_solve_index(tx.get("data", ""))
+    if receipt_info:
+        log(f"📋 Receipt: epochId={receipt_info['epochId']} solveIndex={receipt_info['solveIndex']} credits={receipt_info['credits']}")
+        debug_log("RECEIPT_TX", {"to": tx.get("to", "?"), "chainId": tx.get("chainId", "?"),
+                                 "receipt_epochId": receipt_info["epochId"],
+                                 "receipt_solveIndex": receipt_info["solveIndex"],
+                                 "receipt_credits": receipt_info["credits"],
+                                 "data_len": len(tx.get("data", ""))})
+    else:
+        debug_log("RECEIPT_TX", {"to": tx.get("to", "?"), "chainId": tx.get("chainId", "?"),
+                                 "value": tx.get("value", "?"), "data_len": len(tx.get("data", "")),
+                                 "data_prefix": tx.get("data", "")[:20]})
     for attempt in range(3):
         try:
             tx_result = await bankr.submit_tx(tx, desc)
+            debug_log("RECEIPT_RESPONSE", str(tx_result)[:500])
             if tx_result.get("success"):
-                log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
+                log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}... (to={tx.get('to','?')[:10]}..)")
                 return True
             else:
-                err = tx_result.get("error", "?")
+                err = tx_result.get("error", str(tx_result))
+                code = tx_result.get("code", "")
                 if "in-flight" in str(err).lower():
                     debug_log("RECEIPT_INFLIGHT", f"In-flight limit, retrying in 5s (attempt {attempt+1})")
                     await asyncio.sleep(5)
                     continue
-                debug_log("RECEIPT_FAIL", err)
-                return False
+                tx_info = f"to={tx.get('to','?')[:10]}.. chain={tx.get('chainId','?')} data={len(tx.get('data',''))}chars"
+                log(f"⚠️ Receipt FAILED: {err} [{code}] ({tx_info})", "WARN")
+                debug_log("RECEIPT_FAIL", {"error": err, "code": code, "tx_to": tx.get("to", "?"),
+                                           "data_prefix": tx.get("data", "")[:66]})
+                # Try eth_call to get actual revert reason
+                is_invalid_solve_index = False
+                try:
+                    rpc_url = "https://mainnet.base.org"
+                    call_obj = {"to": tx.get("to"), "data": tx.get("data")}
+                    if miner_addr:
+                        call_obj["from"] = miner_addr
+                    call_payload = {
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                        "params": [call_obj, "latest"]
+                    }
+                    async with bankr.session.post(rpc_url, json=call_payload) as rpc_resp:
+                        rpc_data = await rpc_resp.json()
+                        rpc_err = rpc_data.get("error", {})
+                        rpc_result = rpc_data.get("result", "")
+                        # Check for InvalidSolveIndex() error
+                        err_data = rpc_err.get("data", "") if isinstance(rpc_err, dict) else ""
+                        if INVALID_SOLVE_INDEX_SELECTOR in str(err_data):
+                            is_invalid_solve_index = True
+                            si = receipt_info["solveIndex"] if receipt_info else "?"
+                            log(f"🔍 InvalidSolveIndex! Receipt has solveIndex={si}, contract expects different value", "ERROR")
+                        else:
+                            log(f"🔍 eth_call revert reason: {rpc_err if rpc_err else rpc_result[:200]}", "WARN")
+                except Exception as diag_e:
+                    log(f"🔍 eth_call diagnostic failed: {diag_e}", "WARN")
+                return "invalid_solve_index" if is_invalid_solve_index else False
         except Exception as e:
             if attempt < 2:
                 await asyncio.sleep(3)
@@ -1749,6 +1924,144 @@ async def post_receipt_inline(bankr, tx, desc="CRUDE drilling receipt"):
                 debug_log("RECEIPT_DROP", str(e))
                 return False
     return False
+
+
+async def _get_onchain_next_solve_index(miner_addr):
+    """Query CRUDEDrilling contract for nextSolveIndex of a miner via Base RPC.
+    Storage slot 11 is mapping(address => uint64).
+    Requires pycryptodome for keccak256 — returns None if unavailable."""
+    try:
+        try:
+            from Crypto.Hash import keccak as _keccak_mod
+            def _keccak256(data):
+                k = _keccak_mod.new(digest_bits=256)
+                k.update(data)
+                return k.hexdigest()
+        except ImportError:
+            return None  # pycryptodome not installed — diagnostic only, skip
+        addr_padded = miner_addr.lower().replace("0x", "").zfill(64)
+        slot_padded = hex(11)[2:].zfill(64)
+        storage_key = "0x" + _keccak256(bytes.fromhex(addr_padded + slot_padded))
+        contract = "0x1b3a2a5039A40c989e1257452f8DD8274a254074"
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "eth_getStorageAt",
+            "params": [contract, storage_key, "latest"]
+        }
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post("https://mainnet.base.org", json=payload) as resp:
+                data = await resp.json()
+                return int(data["result"], 16)
+    except Exception:
+        return None
+
+
+async def receipt_worker(bankr, coord, state, tag=""):
+    """Dedicated receipt worker: follows coordinator's nextPendingCrudeLotId chain
+    to post ALL pending receipts (including gap receipts we don't track locally)."""
+    _tag = f"[{tag}] " if tag else ""
+    log(f"{_tag}Receipt worker started ({state.get_pending_receipt_count()} pending)")
+    _backoff = 5
+    _consecutive_fails = 0
+    _gap_posted = 0  # counter for gap receipts posted (not in our local queue)
+
+    while True:
+        try:
+            # Use any known lot to ask coordinator what to post next
+            probe_lot = None
+            local_receipt = state.get_next_pending_receipt()
+            if local_receipt:
+                probe_lot = local_receipt.get("crudeLotId")
+            if not probe_lot:
+                await asyncio.sleep(5)
+                continue
+
+            # Step 1: Check refine/status — coordinator tells us the REAL next lot
+            status_data = await coord.get_refine_status(probe_lot)
+            if not status_data:
+                await asyncio.sleep(30)
+                continue
+
+            next_lot = status_data.get("nextPendingCrudeLotId")
+            probe_status = status_data.get("receiptStatus", "")
+
+            # If our probed lot is already submitted, mark it and move on
+            if probe_status == "submitted":
+                log(f"{_tag}Receipt already on-chain: lot={probe_lot[:16]}...")
+                state.mark_receipt_posted(probe_lot)
+                state.save(force=True)
+                continue
+
+            # Determine which lot to post: nextPendingCrudeLotId (gap lot) or our own
+            # If coordinator doesn't return nextPendingCrudeLotId, post our own lot directly
+            post_lot = probe_lot
+            is_gap_receipt = False
+            if next_lot and next_lot != probe_lot:
+                post_lot = next_lot
+                is_gap_receipt = True
+
+            if is_gap_receipt:
+                # This is a GAP receipt — not in our local queue, coordinator is walking us through
+                log(f"{_tag}📦 Gap receipt: coordinator says post {post_lot[:20]}... first")
+
+            # Step 2: Fetch fresh calldata for the lot to post
+            tx = await coord.get_receipt_calldata(post_lot)
+            if not tx:
+                log(f"{_tag}Failed to fetch calldata for lot {post_lot[:16]}...", "WARN")
+                await asyncio.sleep(30)
+                _consecutive_fails += 1
+                if _consecutive_fails >= 10:
+                    log(f"{_tag}🚫 {_consecutive_fails} consecutive receipt failures, backing off 5 min", "ERROR")
+                    await asyncio.sleep(300)
+                continue
+
+            # Decode for logging
+            info = await _decode_receipt_solve_index(tx.get("data", ""))
+            si = info["solveIndex"] if info else "?"
+            eid = info["epochId"] if info else "?"
+
+            # Step 3: Post receipt
+            result = await post_receipt_inline(bankr, tx, miner_addr=coord.driller)
+
+            if result is True:
+                _consecutive_fails = 0
+                _backoff = 5
+                if is_gap_receipt:
+                    _gap_posted += 1
+                    log(f"{_tag}✅ Gap receipt posted: si={si} epoch={eid} lot={post_lot[:16]}... (gap #{_gap_posted})")
+                    await asyncio.sleep(3)  # wait for TX confirmation before asking coordinator for next
+                else:
+                    state.mark_receipt_posted(post_lot)
+                    state.save(force=True)
+                    log(f"{_tag}✅ Receipt posted: si={si} epoch={eid} lot={post_lot[:16]}...")
+                    await asyncio.sleep(1)
+            elif result == "invalid_solve_index":
+                _consecutive_fails += 1
+                log(f"{_tag}⚠️ InvalidSolveIndex si={si} lot={post_lot[:16]}...", "ERROR")
+                if _consecutive_fails >= 5:
+                    onchain_next = await _get_onchain_next_solve_index(coord.driller)
+                    log(f"{_tag}🚫 On-chain nextSolveIndex={onchain_next}, receipt si={si}. "
+                        f"Pausing 5 min.", "ERROR")
+                    asyncio.create_task(tg_notify(
+                        f"🚫 <b>Receipts blocked!</b>\n"
+                        f"On-chain next: {onchain_next}, receipt: {si}\n"
+                        f"{state.get_pending_receipt_count()} local + gap receipts pending"
+                    ))
+                    await asyncio.sleep(300)
+                else:
+                    await asyncio.sleep(min(_backoff, 60))
+                    _backoff = min(_backoff * 2, 300)
+            else:
+                _consecutive_fails += 1
+                if not is_gap_receipt:
+                    state.mark_receipt_failed(post_lot, "post_failed")
+                    state.save(force=True)
+                await asyncio.sleep(min(_backoff, 60))
+                _backoff = min(_backoff * 2, 120)
+
+        except Exception as e:
+            log(f"{_tag}Receipt worker error: {e}", "WARN")
+            await asyncio.sleep(30)
+
 
 # ============ MAIN LOOPS ============
 async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
@@ -1764,15 +2077,6 @@ async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
 
     while True:
         try:
-            # Await any pending receipt task from previous cycle
-            receipt_task = getattr(state, '_receipt_task', None)
-            if receipt_task and not receipt_task.done():
-                try:
-                    await receipt_task
-                except Exception as e:
-                    debug_log("RECEIPT_TASK_ERR", str(e))
-                state._receipt_task = None
-
             # Ensure auth (with expiry check)
             await coord.ensure_auth()
 
@@ -1850,40 +2154,8 @@ async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
                 m = re.search(r'wait\s+(\d+)s', msg)
                 if m:
                     wait = int(m.group(1)) + 1
-                    # Use cooldown time to fetch receipt for pending lot
-                    pending_lot = getattr(state, '_pending_lot', None)
-                    if pending_lot:
-                        log(f"Cooldown {wait-1}s — polling receipt for {pending_lot[:20]}...")
-                        state._pending_lot = None
-                        receipt_posted = False
-                        for poll in range(wait // 3):
-                            await asyncio.sleep(3)
-                            try:
-                                async with coord.session.get(
-                                    f"{coord.url}/v1/receipt-calldata?crudeLotId={pending_lot}&miner={coord.driller}",
-                                    headers=coord._headers()
-                                ) as rresp:
-                                    rdata = await rresp.json()
-                                    if rresp.status == 200:
-                                        rtx = rdata.get("transaction", {})
-                                        if rtx:
-                                            await post_receipt_inline(bankr, rtx)
-                                            receipt_posted = True
-                                        break
-                                    elif rresp.status != 409:
-                                        debug_log("RECEIPT_ERR", f"{rresp.status}: {rdata}")
-                                        break
-                            except Exception as ex:
-                                debug_log("RECEIPT_POLL_ERR", str(ex))
-                                break
-                        if not receipt_posted:
-                            # Wait remaining cooldown
-                            remaining = max(0, wait - (poll + 1) * 3)
-                            if remaining > 0:
-                                await asyncio.sleep(remaining)
-                    else:
-                        log(f"Drill cooldown {wait-1}s, waiting {wait}s")
-                        await asyncio.sleep(wait)
+                    log(f"Drill cooldown {wait-1}s, waiting {wait}s")
+                    await asyncio.sleep(wait)
                 else:
                     retry_after = getattr(e, 'retry_after', None)
                     wait = retry_after or min(2.0 * (2 ** retry_attempt), 60.0)
@@ -1945,7 +2217,7 @@ async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
                                     log(f"Stale drill solved! +{credits} credits (total: {state.total_credits})")
                                     tx = stale_result.get("transaction", {})
                                     if tx:
-                                        await post_receipt_inline(bankr, tx)
+                                        await post_receipt_inline(bankr, tx, miner_addr=coord.driller)
                                     state.save()
                                 else:
                                     debug_log("STALE_REJECTED", stale_result.get("reason", "?"))
@@ -2154,15 +2426,19 @@ async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
                 bonus_str = f" ({', '.join(bonus_parts)})" if bonus_parts else ""
                 log(f"{_tag}✅ ACCEPTED! +{credits} credits{bonus_str} (total: {state.total_credits})")
 
-                # Post receipt as background task — cooldown is server-side and already ticking
+                # Queue receipt for ordered posting by receipt_worker
+                # Worker always fetches fresh calldata — we only save lotId
                 tx = result.get("transaction", {})
-                if tx:
-                    state._receipt_task = asyncio.create_task(post_receipt_inline(bankr, tx))
-                else:
-                    lot_id = result.get("crudeLotId")
-                    log(f"No tx, crudeLotId={lot_id}, full={result}")
-                    if lot_id:
-                        state._pending_lot = lot_id
+                lot_id = result.get("crudeLotId")
+                if lot_id:
+                    info = await _decode_receipt_solve_index(tx.get("data", "")) if tx else None
+                    si = info["solveIndex"] if info else None
+                    eid = info["epochId"] if info else None
+                    state.add_pending_receipt(lot_id, solve_index=si, epoch_id=eid)
+                    log(f"Receipt queued: lot={lot_id[:16]}.. solveIndex={si}")
+                elif tx:
+                    state.add_pending_receipt(f"noid_{int(time.time())}")
+                    log(f"Receipt queued (no lotId)")
 
                 state.save()
             else:
@@ -2250,9 +2526,17 @@ async def drilling_loop(bankr, coord, solver, state, tier, tag=""):
                                 ))
                             alt_bonus_str = f" ({', '.join(alt_bonus)})" if alt_bonus else ""
                             log(f"{_tag}✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits{alt_bonus_str} (total: {state.total_credits})")
-                            tx = alt_result.get("transaction", {})
-                            if tx:
-                                state._receipt_task = asyncio.create_task(post_receipt_inline(bankr, tx))
+                            # Queue receipt for ordered posting (fresh calldata fetched by worker)
+                            alt_tx = alt_result.get("transaction", {})
+                            alt_lot = alt_result.get("crudeLotId")
+                            if alt_lot:
+                                alt_info = await _decode_receipt_solve_index(alt_tx.get("data", "")) if alt_tx else None
+                                alt_si = alt_info["solveIndex"] if alt_info else None
+                                alt_eid = alt_info["epochId"] if alt_info else None
+                                state.add_pending_receipt(alt_lot, solve_index=alt_si, epoch_id=alt_eid)
+                                log(f"Receipt queued: lot={alt_lot[:16]}.. solveIndex={alt_si}")
+                            elif alt_tx:
+                                state.add_pending_receipt(f"noid_{int(time.time())}")
                             state.save()
                             retry_accepted = True
                             break
@@ -2455,10 +2739,23 @@ async def main():
             await coord.close()
             continue
 
+        # Verify Bankr wallet matches DRILLER_ADDRESS
+        try:
+            bankr_addr = await bankr.get_address()
+            if bankr_addr and wcfg.driller_address:
+                if bankr_addr.lower() != wcfg.driller_address.lower():
+                    log(f"{tag_prefix}⚠️ ADDRESS MISMATCH! Bankr wallet: {bankr_addr}, config: {wcfg.driller_address}", "ERROR")
+                    log(f"{tag_prefix}⚠️ Receipts will FAIL! Fix DRILLER_ADDRESS in .env to match Bankr wallet", "ERROR")
+                else:
+                    log(f"{tag_prefix}✅ Address verified: {bankr_addr[:8]}...{bankr_addr[-4:]}")
+        except Exception as e:
+            debug_log("ADDR_CHECK_ERR", str(e))
+
         instances.append((bankr, coord, wstate, wcfg))
         tasks.append(drilling_loop(bankr, coord, solver, wstate, wcfg.driller_tier, wcfg.tag))
         tasks.append(claim_loop(bankr, coord, wstate, wcfg.tag))
         tasks.append(monitor_loop(bankr, coord, wstate, wcfg.tag))
+        tasks.append(receipt_worker(bankr, coord, wstate, wcfg.tag))
 
     if not instances:
         log("No wallets initialized, exiting", "ERROR")
